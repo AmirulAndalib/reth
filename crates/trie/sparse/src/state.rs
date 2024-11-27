@@ -1,15 +1,14 @@
-use std::iter::Peekable;
-
-use crate::{SparseStateTrieError, SparseStateTrieResult, SparseTrie};
+use crate::{RevealedSparseTrie, SparseStateTrieError, SparseStateTrieResult, SparseTrie};
 use alloy_primitives::{
     map::{HashMap, HashSet},
     Bytes, B256,
 };
 use alloy_rlp::Decodable;
-use reth_trie::{
+use reth_trie_common::{
     updates::{StorageTrieUpdates, TrieUpdates},
-    Nibbles, TrieNode,
+    MultiProof, Nibbles, TrieNode,
 };
+use std::iter::Peekable;
 
 /// Sparse state trie representing lazy-loaded Ethereum state trie.
 #[derive(Default, Debug)]
@@ -47,6 +46,11 @@ impl SparseStateTrie {
         self.revealed.get(account).is_some_and(|slots| slots.contains(slot))
     }
 
+    /// Returned mutable reference to storage sparse trie if it was revealed.
+    pub fn storage_trie_mut(&mut self, account: &B256) -> Option<&mut RevealedSparseTrie> {
+        self.storages.get_mut(account).and_then(|e| e.as_revealed_mut())
+    }
+
     /// Reveal unknown trie paths from provided leaf path and its proof for the account.
     /// NOTE: This method does not extensively validate the proof.
     pub fn reveal_account(
@@ -60,7 +64,7 @@ impl SparseStateTrie {
 
         let mut proof = proof.into_iter().peekable();
 
-        let Some(root_node) = self.validate_proof(&mut proof)? else { return Ok(()) };
+        let Some(root_node) = self.validate_root_node(&mut proof)? else { return Ok(()) };
 
         // Reveal root node if it wasn't already.
         let trie = self.state.reveal_root(root_node, self.retain_updates)?;
@@ -91,7 +95,7 @@ impl SparseStateTrie {
 
         let mut proof = proof.into_iter().peekable();
 
-        let Some(root_node) = self.validate_proof(&mut proof)? else { return Ok(()) };
+        let Some(root_node) = self.validate_root_node(&mut proof)? else { return Ok(()) };
 
         // Reveal root node if it wasn't already.
         let trie = self
@@ -112,8 +116,56 @@ impl SparseStateTrie {
         Ok(())
     }
 
+    /// Reveal unknown trie paths from multiproof and the list of included accounts and slots.
+    /// NOTE: This method does not extensively validate the proof.
+    pub fn reveal_multiproof(
+        &mut self,
+        targets: HashMap<B256, HashSet<B256>>,
+        multiproof: MultiProof,
+    ) -> SparseStateTrieResult<()> {
+        let account_subtree = multiproof.account_subtree.into_nodes_sorted();
+        let mut account_nodes = account_subtree.into_iter().peekable();
+
+        if let Some(root_node) = self.validate_root_node(&mut account_nodes)? {
+            // Reveal root node if it wasn't already.
+            let trie = self.state.reveal_root(root_node, self.retain_updates)?;
+
+            // Reveal the remaining proof nodes.
+            for (path, bytes) in account_nodes {
+                let node = TrieNode::decode(&mut &bytes[..])?;
+                trie.reveal_node(path, node)?;
+            }
+        }
+
+        for (account, storage_subtree) in multiproof.storages {
+            let storage_subtree = storage_subtree.subtree.into_nodes_sorted();
+            let mut storage_nodes = storage_subtree.into_iter().peekable();
+
+            if let Some(root_node) = self.validate_root_node(&mut storage_nodes)? {
+                // Reveal root node if it wasn't already.
+                let trie = self
+                    .storages
+                    .entry(account)
+                    .or_default()
+                    .reveal_root(root_node, self.retain_updates)?;
+
+                // Reveal the remaining proof nodes.
+                for (path, bytes) in storage_nodes {
+                    let node = TrieNode::decode(&mut &bytes[..])?;
+                    trie.reveal_node(path, node)?;
+                }
+            }
+        }
+
+        for (account, slots) in targets {
+            self.revealed.entry(account).or_default().extend(slots);
+        }
+
+        Ok(())
+    }
+
     /// Validates the root node of the proof and returns it if it exists and is valid.
-    fn validate_proof<I: Iterator<Item = (Nibbles, Bytes)>>(
+    fn validate_root_node<I: Iterator<Item = (Nibbles, Bytes)>>(
         &self,
         proof: &mut Peekable<I>,
     ) -> SparseStateTrieResult<Option<TrieNode>> {
@@ -150,16 +202,6 @@ impl SparseStateTrie {
         Ok(())
     }
 
-    /// Returns sparse trie root if the trie has been revealed.
-    pub fn root(&mut self) -> Option<B256> {
-        self.state.root()
-    }
-
-    /// Calculates the hashes of the nodes below the provided level.
-    pub fn calculate_below_level(&mut self, level: usize) {
-        self.state.calculate_below_level(level);
-    }
-
     /// Update the leaf node of a storage trie at the provided address.
     pub fn update_storage_leaf(
         &mut self,
@@ -171,6 +213,16 @@ impl SparseStateTrie {
         Ok(())
     }
 
+    /// Update the leaf node of a storage trie at the provided address.
+    pub fn remove_storage_leaf(
+        &mut self,
+        address: B256,
+        slot: &Nibbles,
+    ) -> SparseStateTrieResult<()> {
+        self.storages.entry(address).or_default().remove_leaf(slot)?;
+        Ok(())
+    }
+
     /// Wipe the storage trie at the provided address.
     pub fn wipe_storage(&mut self, address: B256) -> SparseStateTrieResult<()> {
         let Some(trie) = self.storages.get_mut(&address) else { return Ok(()) };
@@ -178,9 +230,19 @@ impl SparseStateTrie {
         trie.wipe().map_err(Into::into)
     }
 
+    /// Calculates the hashes of the nodes below the provided level.
+    pub fn calculate_below_level(&mut self, level: usize) {
+        self.state.calculate_below_level(level);
+    }
+
     /// Returns storage sparse trie root if the trie has been revealed.
     pub fn storage_root(&mut self, account: B256) -> Option<B256> {
         self.storages.get_mut(&account).and_then(|trie| trie.root())
+    }
+
+    /// Returns sparse trie root if the trie has been revealed.
+    pub fn root(&mut self) -> Option<B256> {
+        self.state.root()
     }
 
     /// Returns [`TrieUpdates`] by taking the updates from the revealed sparse tries.
@@ -232,7 +294,7 @@ mod tests {
         let sparse = SparseStateTrie::default();
         let proof = [(Nibbles::from_nibbles([0x1]), Bytes::from([EMPTY_STRING_CODE]))];
         assert_matches!(
-            sparse.validate_proof(&mut proof.into_iter().peekable()),
+            sparse.validate_root_node(&mut proof.into_iter().peekable()),
             Err(SparseStateTrieError::InvalidRootNode { .. })
         );
     }
@@ -245,7 +307,7 @@ mod tests {
             (Nibbles::from_nibbles([0x1]), Bytes::new()),
         ];
         assert_matches!(
-            sparse.validate_proof(&mut proof.into_iter().peekable()),
+            sparse.validate_root_node(&mut proof.into_iter().peekable()),
             Err(SparseStateTrieError::InvalidRootNode { .. })
         );
     }

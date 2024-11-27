@@ -6,8 +6,9 @@ use node::NodeTestContext;
 use reth::{
     args::{DiscoveryArgs, NetworkArgs, RpcServerArgs},
     blockchain_tree::externals::NodeTypesForTree,
-    builder::{FullNodePrimitives, NodeBuilder, NodeConfig, NodeHandle},
+    builder::{NodeBuilder, NodeConfig, NodeHandle},
     network::PeersHandleProvider,
+    primitives::EthPrimitives,
     rpc::server_types::RpcModuleSelection,
     tasks::TaskManager,
 };
@@ -15,9 +16,10 @@ use reth_chainspec::EthChainSpec;
 use reth_db::{test_utils::TempDatabase, DatabaseEnv};
 use reth_engine_local::LocalPayloadAttributesBuilder;
 use reth_node_builder::{
-    components::NodeComponentsBuilder, rpc::RethRpcAddOns, EngineNodeLauncher,
-    FullNodeTypesAdapter, Node, NodeAdapter, NodeComponents, NodeTypesWithDBAdapter,
-    NodeTypesWithEngine, PayloadAttributesBuilder, PayloadTypes,
+    components::NodeComponentsBuilder,
+    rpc::{EngineValidatorAddOn, RethRpcAddOns},
+    EngineNodeLauncher, FullNodeTypesAdapter, Node, NodeAdapter, NodeComponents,
+    NodeTypesWithDBAdapter, NodeTypesWithEngine, PayloadAttributesBuilder, PayloadTypes,
 };
 use reth_provider::providers::{BlockchainProvider, BlockchainProvider2, NodeTypesForProvider};
 use tracing::{span, Level};
@@ -121,7 +123,7 @@ pub async fn setup_engine<N>(
 where
     N: Default
         + Node<TmpNodeAdapter<N, BlockchainProvider2<NodeTypesWithDBAdapter<N, TmpDB>>>>
-        + NodeTypesWithEngine
+        + NodeTypesWithEngine<Primitives = EthPrimitives>
         + NodeTypesForProvider,
     N::ComponentsBuilder: NodeComponentsBuilder<
         TmpNodeAdapter<N, BlockchainProvider2<NodeTypesWithDBAdapter<N, TmpDB>>>,
@@ -130,12 +132,11 @@ where
             Network: PeersHandleProvider,
         >,
     >,
-    N::AddOns: RethRpcAddOns<Adapter<N, BlockchainProvider2<NodeTypesWithDBAdapter<N, TmpDB>>>>,
+    N::AddOns: RethRpcAddOns<Adapter<N, BlockchainProvider2<NodeTypesWithDBAdapter<N, TmpDB>>>>
+        + EngineValidatorAddOn<Adapter<N, BlockchainProvider2<NodeTypesWithDBAdapter<N, TmpDB>>>>,
     LocalPayloadAttributesBuilder<N::ChainSpec>: PayloadAttributesBuilder<
         <<N as NodeTypesWithEngine>::Engine as PayloadTypes>::PayloadAttributes,
     >,
-    N::Primitives:
-        FullNodePrimitives<Block = reth_primitives::Block, BlockBody = reth_primitives::BlockBody>,
 {
     let tasks = TaskManager::current();
     let exec = tasks.executor();
