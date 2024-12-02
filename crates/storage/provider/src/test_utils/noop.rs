@@ -27,7 +27,7 @@ use reth_primitives::{
 };
 use reth_prune_types::{PruneCheckpoint, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
-use reth_storage_api::{StateProofProvider, StorageRootProvider};
+use reth_storage_api::{NodePrimitivesProvider, StateProofProvider, StorageRootProvider};
 use reth_storage_errors::provider::ProviderResult;
 use reth_trie::{
     updates::TrieUpdates, AccountProof, HashedPostState, HashedStorage, MultiProof, TrieInput,
@@ -260,6 +260,7 @@ impl TransactionsProvider for NoopProvider {
 }
 
 impl ReceiptProvider for NoopProvider {
+    type Receipt = Receipt;
     fn receipt(&self, _id: TxNumber) -> ProviderResult<Option<Receipt>> {
         Ok(None)
     }
@@ -283,6 +284,8 @@ impl ReceiptProvider for NoopProvider {
 impl ReceiptProviderIdExt for NoopProvider {}
 
 impl HeaderProvider for NoopProvider {
+    type Header = Header;
+
     fn header(&self, _block_hash: &BlockHash) -> ProviderResult<Option<Header>> {
         Ok(None)
     }
@@ -371,6 +374,15 @@ impl StorageRootProvider for NoopProvider {
         _hashed_storage: HashedStorage,
     ) -> ProviderResult<reth_trie::StorageProof> {
         Ok(reth_trie::StorageProof::new(slot))
+    }
+
+    fn storage_multiproof(
+        &self,
+        _address: Address,
+        _slots: &[B256],
+        _hashed_storage: HashedStorage,
+    ) -> ProviderResult<reth_trie::StorageMultiProof> {
+        Ok(reth_trie::StorageMultiProof::empty())
     }
 }
 
@@ -559,9 +571,11 @@ impl PruneCheckpointReader for NoopProvider {
     }
 }
 
-impl StaticFileProviderFactory for NoopProvider {
+impl NodePrimitivesProvider for NoopProvider {
     type Primitives = EthPrimitives;
+}
 
+impl StaticFileProviderFactory for NoopProvider {
     fn static_file_provider(&self) -> StaticFileProvider<Self::Primitives> {
         StaticFileProvider::read_only(PathBuf::default(), false).unwrap()
     }
@@ -574,6 +588,8 @@ impl CanonStateSubscriptions for NoopProvider {
 }
 
 impl ForkChoiceSubscriptions for NoopProvider {
+    type Header = Header;
+
     fn subscribe_safe_block(&self) -> ForkChoiceNotifications {
         let (_, rx) = watch::channel(None);
         ForkChoiceNotifications(rx)

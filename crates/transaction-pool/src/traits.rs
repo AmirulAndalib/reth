@@ -23,6 +23,7 @@ use reth_primitives::{
     PooledTransactionsElementEcRecovered, SealedBlock, Transaction, TransactionSigned,
     TransactionSignedEcRecovered,
 };
+use reth_primitives_traits::SignedTransaction;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 use std::{
@@ -231,17 +232,41 @@ pub trait TransactionPool: Send + Sync + Clone {
         &self,
         tx_hashes: Vec<TxHash>,
         limit: GetPooledTransactionLimit,
-    ) -> Vec<PooledTransactionsElement>;
+    ) -> Vec<<Self::Transaction as PoolTransaction>::Pooled>;
 
-    /// Returns converted [PooledTransactionsElement] for the given transaction hash.
+    /// Returns the pooled transaction variant for the given transaction hash as the requested type.
+    fn get_pooled_transactions_as<T>(
+        &self,
+        tx_hashes: Vec<TxHash>,
+        limit: GetPooledTransactionLimit,
+    ) -> Vec<T>
+    where
+        <Self::Transaction as PoolTransaction>::Pooled: Into<T>;
+
+    /// Returns the pooled transaction variant for the given transaction hash.
     ///
     /// This adheres to the expected behavior of
     /// [`GetPooledTransactions`](https://github.com/ethereum/devp2p/blob/master/caps/eth.md#getpooledtransactions-0x09):
     ///
     /// If the transaction is a blob transaction, the sidecar will be included.
     ///
+    /// It is expected that this variant represents the valid p2p format for full transactions.
+    /// E.g. for EIP-4844 transactions this is the consensus transaction format with the blob
+    /// sidecar.
+    ///
     /// Consumer: P2P
-    fn get_pooled_transaction_element(&self, tx_hash: TxHash) -> Option<PooledTransactionsElement>;
+    fn get_pooled_transaction_element(
+        &self,
+        tx_hash: TxHash,
+    ) -> Option<<Self::Transaction as PoolTransaction>::Pooled>;
+
+    /// Returns the pooled transaction variant for the given transaction hash as the requested type.
+    fn get_pooled_transaction_as<T>(&self, tx_hash: TxHash) -> Option<T>
+    where
+        <Self::Transaction as PoolTransaction>::Pooled: Into<T>,
+    {
+        self.get_pooled_transaction_element(tx_hash).map(Into::into)
+    }
 
     /// Returns an iterator that yields transactions that are ready for block production.
     ///
@@ -269,6 +294,15 @@ pub trait TransactionPool: Send + Sync + Clone {
     ///
     /// Consumer: RPC
     fn pending_transactions(&self) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>>;
+
+    /// Returns first `max` transactions that can be included in the next block.
+    /// See <https://github.com/paradigmxyz/reth/issues/12767#issuecomment-2493223579>
+    ///
+    /// Consumer: Block production
+    fn pending_transactions_max(
+        &self,
+        max: usize,
+    ) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>>;
 
     /// Returns all transactions that can be included in _future_ blocks.
     ///
@@ -772,7 +806,7 @@ pub trait BestTransactions: Iterator + Send {
     /// Implementers must ensure all subsequent transaction _don't_ depend on this transaction.
     /// In other words, this must remove the given transaction _and_ drain all transaction that
     /// depend on it.
-    fn mark_invalid(&mut self, transaction: &Self::Item);
+    fn mark_invalid(&mut self, transaction: &Self::Item, kind: InvalidPoolTransactionError);
 
     /// An iterator may be able to receive additional pending transactions that weren't present it
     /// the pool when it was created.
@@ -834,8 +868,8 @@ impl<T> BestTransactions for Box<T>
 where
     T: BestTransactions + ?Sized,
 {
-    fn mark_invalid(&mut self, transaction: &Self::Item) {
-        (**self).mark_invalid(transaction);
+    fn mark_invalid(&mut self, transaction: &Self::Item, kind: InvalidPoolTransactionError) {
+        (**self).mark_invalid(transaction, kind)
     }
 
     fn no_updates(&mut self) {
@@ -853,7 +887,7 @@ where
 
 /// A no-op implementation that yields no transactions.
 impl<T> BestTransactions for std::iter::Empty<T> {
-    fn mark_invalid(&mut self, _tx: &T) {}
+    fn mark_invalid(&mut self, _tx: &T, _kind: InvalidPoolTransactionError) {}
 
     fn no_updates(&mut self) {}
 
@@ -938,11 +972,18 @@ pub trait PoolTransaction: fmt::Debug + Send + Sync + Clone {
     type Consensus: From<Self> + TryInto<Self, Error = Self::TryFromConsensusError>;
 
     /// Associated type representing the recovered pooled variant of the transaction.
-    type Pooled: Into<Self>;
+    type Pooled: Encodable2718 + Into<Self>;
 
     /// Define a method to convert from the `Consensus` type to `Self`
     fn try_from_consensus(tx: Self::Consensus) -> Result<Self, Self::TryFromConsensusError> {
         tx.try_into()
+    }
+
+    /// Clone the transaction into a consensus variant.
+    ///
+    /// This method is preferred when the [`PoolTransaction`] already wraps the consensus variant.
+    fn clone_into_consensus(&self) -> Self::Consensus {
+        self.clone().into_consensus()
     }
 
     /// Define a method to convert from the `Self` type to `Consensus`
@@ -1020,6 +1061,11 @@ pub trait PoolTransaction: fmt::Debug + Send + Sync + Clone {
     /// [`TxKind::Create`] if the transaction is a contract creation.
     fn kind(&self) -> TxKind;
 
+    /// Returns true if the transaction is a contract creation.
+    /// We don't provide a default implementation via `kind` as it copies the 21-byte
+    /// [`TxKind`] for this simple check. A proper implementation shouldn't allocate.
+    fn is_create(&self) -> bool;
+
     /// Returns the recipient of the transaction if it is not a [`TxKind::Create`]
     /// transaction.
     fn to(&self) -> Option<Address> {
@@ -1068,7 +1114,7 @@ pub trait PoolTransaction: fmt::Debug + Send + Sync + Clone {
         &self,
         max_init_code_size: usize,
     ) -> Result<(), InvalidPoolTransactionError> {
-        if self.kind().is_create() && self.input().len() > max_init_code_size {
+        if self.is_create() && self.input().len() > max_init_code_size {
             Err(InvalidPoolTransactionError::ExceedsMaxInitCodeSize(
                 self.size(),
                 max_init_code_size,
@@ -1203,6 +1249,10 @@ impl PoolTransaction for EthPooledTransaction {
 
     type Pooled = PooledTransactionsElementEcRecovered;
 
+    fn clone_into_consensus(&self) -> Self::Consensus {
+        self.transaction().clone()
+    }
+
     fn try_consensus_into_pooled(
         tx: Self::Consensus,
     ) -> Result<Self::Pooled, Self::TryFromConsensusError> {
@@ -1211,7 +1261,7 @@ impl PoolTransaction for EthPooledTransaction {
 
     /// Returns hash of the transaction.
     fn hash(&self) -> &TxHash {
-        self.transaction.hash_ref()
+        self.transaction.tx_hash()
     }
 
     /// Returns the Sender of the transaction.
@@ -1281,6 +1331,11 @@ impl PoolTransaction for EthPooledTransaction {
     /// [`TxKind::Create`] if the transaction is a contract creation.
     fn kind(&self) -> TxKind {
         self.transaction.kind()
+    }
+
+    /// Returns true if the transaction is a contract creation.
+    fn is_create(&self) -> bool {
+        self.transaction.is_create()
     }
 
     fn input(&self) -> &[u8] {
