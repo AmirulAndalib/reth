@@ -1,30 +1,32 @@
-use alloy_consensus::{BlobTransactionValidationError, EnvKzgSettings, Transaction};
-use alloy_eips::eip4844::kzg_to_versioned_hash;
+use alloy_consensus::{
+    BlobTransactionValidationError, BlockHeader, EnvKzgSettings, Transaction, TxReceipt,
+};
+use alloy_eips::{eip4844::kzg_to_versioned_hash, eip7685::RequestsOrHash};
 use alloy_rpc_types_beacon::relay::{
     BidTrace, BuilderBlockValidationRequest, BuilderBlockValidationRequestV2,
     BuilderBlockValidationRequestV3, BuilderBlockValidationRequestV4,
 };
 use alloy_rpc_types_engine::{
     BlobsBundleV1, CancunPayloadFields, ExecutionPayload, ExecutionPayloadSidecar, PayloadError,
+    PraguePayloadFields,
 };
 use async_trait::async_trait;
 use jsonrpsee::core::RpcResult;
 use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
-use reth_consensus::{Consensus, PostExecutionInput};
+use reth_consensus::{Consensus, FullConsensus, PostExecutionInput};
 use reth_errors::{BlockExecutionError, ConsensusError, ProviderError};
 use reth_ethereum_consensus::GAS_LIMIT_BOUND_DIVISOR;
 use reth_evm::execute::{BlockExecutorProvider, Executor};
 use reth_payload_validator::ExecutionPayloadValidator;
-use reth_primitives::{Block, GotExpected, Receipt, SealedBlockWithSenders, SealedHeader};
+use reth_primitives::{GotExpected, NodePrimitives, SealedBlockWithSenders, SealedHeader};
+use reth_primitives_traits::{Block as _, BlockBody};
 use reth_provider::{
-    AccountReader, BlockExecutionInput, BlockExecutionOutput, BlockReaderIdExt, HeaderProvider,
-    StateProviderFactory, WithdrawalsProvider,
+    BlockExecutionInput, BlockExecutionOutput, BlockReaderIdExt, StateProviderFactory,
 };
 use reth_revm::{cached::CachedReads, database::StateProviderDatabase};
 use reth_rpc_api::BlockSubmissionValidationApiServer;
 use reth_rpc_server_types::result::internal_rpc_err;
 use reth_tasks::TaskSpawner;
-use reth_trie::HashedPostState;
 use revm_primitives::{Address, B256, U256};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, sync::Arc};
@@ -32,7 +34,7 @@ use tokio::sync::{oneshot, RwLock};
 
 /// The type that implements the `validation` rpc namespace trait
 #[derive(Clone, Debug, derive_more::Deref)]
-pub struct ValidationApi<Provider: ChainSpecProvider, E> {
+pub struct ValidationApi<Provider: ChainSpecProvider, E: BlockExecutorProvider> {
     #[deref]
     inner: Arc<ValidationApiInner<Provider, E>>,
 }
@@ -40,11 +42,12 @@ pub struct ValidationApi<Provider: ChainSpecProvider, E> {
 impl<Provider, E> ValidationApi<Provider, E>
 where
     Provider: ChainSpecProvider,
+    E: BlockExecutorProvider,
 {
     /// Create a new instance of the [`ValidationApi`]
     pub fn new(
         provider: Provider,
-        consensus: Arc<dyn Consensus>,
+        consensus: Arc<dyn FullConsensus<E::Primitives>>,
         executor_provider: E,
         config: ValidationApiConfig,
         task_spawner: Box<dyn TaskSpawner>,
@@ -88,19 +91,21 @@ where
 
 impl<Provider, E> ValidationApi<Provider, E>
 where
-    Provider: BlockReaderIdExt
+    Provider: BlockReaderIdExt<Header = reth_primitives::Header>
         + ChainSpecProvider<ChainSpec: EthereumHardforks>
         + StateProviderFactory
-        + HeaderProvider
-        + AccountReader
-        + WithdrawalsProvider
         + 'static,
-    E: BlockExecutorProvider,
+    E: BlockExecutorProvider<
+        Primitives: NodePrimitives<
+            BlockHeader = Provider::Header,
+            BlockBody = reth_primitives::BlockBody,
+        >,
+    >,
 {
     /// Validates the given block and a [`BidTrace`] against it.
     pub async fn validate_message_against_block(
         &self,
-        block: SealedBlockWithSenders,
+        block: SealedBlockWithSenders<<E::Primitives as NodePrimitives>::Block>,
         message: BidTrace,
         registered_gas_limit: u64,
     ) -> Result<(), ValidationApiError> {
@@ -180,11 +185,11 @@ where
         self.ensure_payment(&block, &output, &message)?;
 
         let state_root =
-            state_provider.state_root(HashedPostState::from_bundle_state(&output.state.state))?;
+            state_provider.state_root(state_provider.hashed_post_state(&output.state))?;
 
-        if state_root != block.state_root {
+        if state_root != block.header().state_root() {
             return Err(ConsensusError::BodyStateRootDiff(
-                GotExpected { got: state_root, expected: block.state_root }.into(),
+                GotExpected { got: state_root, expected: block.header().state_root() }.into(),
             )
             .into())
         }
@@ -257,8 +262,8 @@ where
     /// to checking the latest block transaction.
     fn ensure_payment(
         &self,
-        block: &Block,
-        output: &BlockExecutionOutput<Receipt>,
+        block: &<E::Primitives as NodePrimitives>::Block,
+        output: &BlockExecutionOutput<<E::Primitives as NodePrimitives>::Receipt>,
         message: &BidTrace,
     ) -> Result<(), ValidationApiError> {
         let (mut balance_before, balance_after) = if let Some(acc) =
@@ -274,7 +279,7 @@ where
             (U256::ZERO, U256::ZERO)
         };
 
-        if let Some(withdrawals) = &block.body.withdrawals {
+        if let Some(withdrawals) = block.body().withdrawals() {
             for withdrawal in withdrawals {
                 if withdrawal.address == message.proposer_fee_recipient {
                     balance_before += withdrawal.amount_wei();
@@ -289,10 +294,10 @@ where
         let (receipt, tx) = output
             .receipts
             .last()
-            .zip(block.body.transactions.last())
+            .zip(block.body().transactions().last())
             .ok_or(ValidationApiError::ProposerPayment)?;
 
-        if !receipt.success {
+        if !receipt.status() {
             return Err(ValidationApiError::ProposerPayment)
         }
 
@@ -308,7 +313,7 @@ where
             return Err(ValidationApiError::ProposerPayment)
         }
 
-        if let Some(block_base_fee) = block.base_fee_per_gas {
+        if let Some(block_base_fee) = block.header().base_fee_per_gas() {
             if tx.effective_tip_per_gas(block_base_fee).unwrap_or_default() != 0 {
                 return Err(ValidationApiError::ProposerPayment)
             }
@@ -381,7 +386,12 @@ where
                         versioned_hashes: self
                             .validate_blobs_bundle(request.request.blobs_bundle)?,
                     },
-                    request.request.execution_requests.into(),
+                    PraguePayloadFields {
+                        requests: RequestsOrHash::Requests(
+                            request.request.execution_requests.into(),
+                        ),
+                        target_blobs_per_block: request.request.target_blobs_per_block,
+                    },
                 ),
             )?
             .try_seal_with_senders()
@@ -399,15 +409,17 @@ where
 #[async_trait]
 impl<Provider, E> BlockSubmissionValidationApiServer for ValidationApi<Provider, E>
 where
-    Provider: BlockReaderIdExt
+    Provider: BlockReaderIdExt<Header = reth_primitives::Header>
         + ChainSpecProvider<ChainSpec: EthereumHardforks>
         + StateProviderFactory
-        + HeaderProvider
-        + AccountReader
-        + WithdrawalsProvider
         + Clone
         + 'static,
-    E: BlockExecutorProvider,
+    E: BlockExecutorProvider<
+        Primitives: NodePrimitives<
+            BlockHeader = Provider::Header,
+            BlockBody = reth_primitives::BlockBody,
+        >,
+    >,
 {
     async fn validate_builder_submission_v1(
         &self,
@@ -461,11 +473,11 @@ where
 }
 
 #[derive(Debug)]
-pub struct ValidationApiInner<Provider: ChainSpecProvider, E> {
+pub struct ValidationApiInner<Provider: ChainSpecProvider, E: BlockExecutorProvider> {
     /// The provider that can interact with the chain.
     provider: Provider,
     /// Consensus implementation.
-    consensus: Arc<dyn Consensus>,
+    consensus: Arc<dyn FullConsensus<E::Primitives>>,
     /// Execution payload validator.
     payload_validator: ExecutionPayloadValidator<Provider::ChainSpec>,
     /// Block executor factory.

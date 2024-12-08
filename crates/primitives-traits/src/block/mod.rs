@@ -4,6 +4,7 @@ pub mod body;
 pub mod header;
 
 use alloc::fmt;
+use alloy_rlp::{Decodable, Encodable};
 
 use crate::{
     BlockBody, BlockHeader, FullBlockBody, FullBlockHeader, InMemorySize, MaybeArbitrary,
@@ -39,12 +40,14 @@ pub trait Block:
     + InMemorySize
     + MaybeSerde
     + MaybeArbitrary
+    + Encodable
+    + Decodable
 {
     /// Header part of the block.
-    type Header: BlockHeader + 'static;
+    type Header: BlockHeader;
 
     /// The block's body contains the transactions in the block.
-    type Body: BlockBody + Send + Sync + Unpin + 'static;
+    type Body: BlockBody<OmmerHeader = Self::Header>;
 
     /// Create new block instance.
     fn new(header: Self::Header, body: Self::Body) -> Self;

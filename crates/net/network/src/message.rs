@@ -55,7 +55,7 @@ pub enum PeerMessage<N: NetworkPrimitives = EthNetworkPrimitives> {
     PooledTransactions(NewPooledTransactionHashes),
     /// All `eth` request variants.
     EthRequest(PeerRequest<N>),
-    /// Other than eth namespace message
+    /// Any other or manually crafted eth message.
     Other(RawCapabilityMessage),
 }
 
@@ -150,7 +150,7 @@ pub enum PeerResponseResult<N: NetworkPrimitives = EthNetworkPrimitives> {
     /// Represents a result containing node data or an error.
     NodeData(RequestResult<Vec<Bytes>>),
     /// Represents a result containing receipts or an error.
-    Receipts(RequestResult<Vec<Vec<ReceiptWithBloom>>>),
+    Receipts(RequestResult<Vec<Vec<ReceiptWithBloom<reth_primitives::Receipt>>>>),
 }
 
 // === impl PeerResponseResult ===

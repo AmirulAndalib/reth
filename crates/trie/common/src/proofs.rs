@@ -2,17 +2,19 @@
 
 use crate::{Nibbles, TrieAccount};
 use alloy_consensus::constants::KECCAK_EMPTY;
-use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
+use alloy_primitives::{
+    keccak256,
+    map::{hash_map, HashMap},
+    Address, Bytes, B256, U256,
+};
 use alloy_rlp::{encode_fixed_size, Decodable, EMPTY_STRING_CODE};
 use alloy_trie::{
     nodes::TrieNode,
     proof::{verify_proof, ProofNodes, ProofVerificationError},
-    EMPTY_ROOT_HASH,
+    TrieMask, EMPTY_ROOT_HASH,
 };
 use itertools::Itertools;
 use reth_primitives_traits::Account;
-use serde::{Deserialize, Serialize};
-use std::collections::{hash_map, HashMap};
 
 /// The state multiproof of target accounts and multiproofs of their storage tries.
 /// Multiproof is effectively a state subtrie that only contains the nodes
@@ -21,6 +23,8 @@ use std::collections::{hash_map, HashMap};
 pub struct MultiProof {
     /// State trie multiproof for requested accounts.
     pub account_subtree: ProofNodes,
+    /// The hash masks of the branch nodes in the account proof.
+    pub branch_node_hash_masks: HashMap<Nibbles, TrieMask>,
     /// Storage trie multiproofs.
     pub storages: HashMap<B256, StorageMultiProof>,
 }
@@ -106,11 +110,15 @@ impl MultiProof {
     pub fn extend(&mut self, other: Self) {
         self.account_subtree.extend_from(other.account_subtree);
 
+        self.branch_node_hash_masks.extend(other.branch_node_hash_masks);
+
         for (hashed_address, storage) in other.storages {
             match self.storages.entry(hashed_address) {
                 hash_map::Entry::Occupied(mut entry) => {
                     debug_assert_eq!(entry.get().root, storage.root);
-                    entry.get_mut().subtree.extend_from(storage.subtree);
+                    let entry = entry.get_mut();
+                    entry.subtree.extend_from(storage.subtree);
+                    entry.branch_node_hash_masks.extend(storage.branch_node_hash_masks);
                 }
                 hash_map::Entry::Vacant(entry) => {
                     entry.insert(storage);
@@ -127,6 +135,8 @@ pub struct StorageMultiProof {
     pub root: B256,
     /// Storage multiproof for requested slots.
     pub subtree: ProofNodes,
+    /// The hash masks of the branch nodes in the storage proof.
+    pub branch_node_hash_masks: HashMap<Nibbles, TrieMask>,
 }
 
 impl StorageMultiProof {
@@ -138,6 +148,7 @@ impl StorageMultiProof {
                 Nibbles::default(),
                 Bytes::from([EMPTY_STRING_CODE]),
             )]),
+            branch_node_hash_masks: HashMap::default(),
         }
     }
 
@@ -171,8 +182,9 @@ impl StorageMultiProof {
 }
 
 /// The merkle proof with the relevant account info.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Debug)]
+#[cfg_attr(any(test, feature = "serde"), derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(any(test, feature = "serde"), serde(rename_all = "camelCase"))]
 pub struct AccountProof {
     /// The address associated with the account.
     pub address: Address,
@@ -185,6 +197,33 @@ pub struct AccountProof {
     pub storage_root: B256,
     /// Array of storage proofs as requested.
     pub storage_proofs: Vec<StorageProof>,
+}
+
+#[cfg(feature = "eip1186")]
+impl AccountProof {
+    /// Convert into an EIP-1186 account proof response
+    pub fn into_eip1186_response(
+        self,
+        slots: Vec<alloy_serde::JsonStorageKey>,
+    ) -> alloy_rpc_types_eth::EIP1186AccountProofResponse {
+        let info = self.info.unwrap_or_default();
+        alloy_rpc_types_eth::EIP1186AccountProofResponse {
+            address: self.address,
+            balance: info.balance,
+            code_hash: info.get_bytecode_hash(),
+            nonce: info.nonce,
+            storage_hash: self.storage_root,
+            account_proof: self.proof,
+            storage_proof: self
+                .storage_proofs
+                .into_iter()
+                .filter_map(|proof| {
+                    let input_slot = slots.iter().find(|s| s.as_b256() == proof.key)?;
+                    Some(proof.into_eip1186_proof(*input_slot))
+                })
+                .collect(),
+        }
+    }
 }
 
 impl Default for AccountProof {
@@ -227,7 +266,8 @@ impl AccountProof {
 }
 
 /// The merkle proof of the storage entry.
-#[derive(Clone, PartialEq, Eq, Default, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Default, Debug)]
+#[cfg_attr(any(test, feature = "serde"), derive(serde::Serialize, serde::Deserialize))]
 pub struct StorageProof {
     /// The raw storage key.
     pub key: B256,
@@ -238,6 +278,17 @@ pub struct StorageProof {
     /// Array of rlp-serialized merkle trie nodes which starting from the storage root node and
     /// following the path of the hashed storage slot as key.
     pub proof: Vec<Bytes>,
+}
+
+impl StorageProof {
+    /// Convert into an EIP-1186 storage proof
+    #[cfg(feature = "eip1186")]
+    pub fn into_eip1186_proof(
+        self,
+        slot: alloy_serde::JsonStorageKey,
+    ) -> alloy_rpc_types_eth::EIP1186StorageProof {
+        alloy_rpc_types_eth::EIP1186StorageProof { key: slot, value: self.value, proof: self.proof }
+    }
 }
 
 impl StorageProof {
@@ -338,14 +389,28 @@ mod tests {
             Nibbles::from_nibbles(vec![0]),
             alloy_rlp::encode_fixed_size(&U256::from(42)).to_vec().into(),
         );
-        proof1.storages.insert(addr, StorageMultiProof { root, subtree: subtree1 });
+        proof1.storages.insert(
+            addr,
+            StorageMultiProof {
+                root,
+                subtree: subtree1,
+                branch_node_hash_masks: HashMap::default(),
+            },
+        );
 
         let mut subtree2 = ProofNodes::default();
         subtree2.insert(
             Nibbles::from_nibbles(vec![1]),
             alloy_rlp::encode_fixed_size(&U256::from(43)).to_vec().into(),
         );
-        proof2.storages.insert(addr, StorageMultiProof { root, subtree: subtree2 });
+        proof2.storages.insert(
+            addr,
+            StorageMultiProof {
+                root,
+                subtree: subtree2,
+                branch_node_hash_masks: HashMap::default(),
+            },
+        );
 
         proof1.extend(proof2);
 

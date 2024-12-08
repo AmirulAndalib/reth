@@ -21,12 +21,12 @@ use reth_network_p2p::{
     sync::{NetworkSyncUpdater, SyncState},
     EthBlockClient,
 };
-use reth_node_types::{Block, BlockTy, NodeTypesWithEngine};
+use reth_node_types::{Block, BlockTy, HeaderTy, NodeTypesWithEngine};
 use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_builder_primitives::PayloadBuilder;
 use reth_payload_primitives::{PayloadAttributes, PayloadBuilderAttributes};
 use reth_payload_validator::ExecutionPayloadValidator;
-use reth_primitives::{Head, SealedBlock, SealedHeader};
+use reth_primitives::{EthPrimitives, Head, SealedBlock, SealedHeader};
 use reth_provider::{
     providers::ProviderNodeTypes, BlockIdReader, BlockReader, BlockSource, CanonChainTracker,
     ChainSpecProvider, ProviderError, StageCheckpointReader,
@@ -84,9 +84,15 @@ const MAX_INVALID_HEADERS: u32 = 512u32;
 pub const MIN_BLOCKS_FOR_PIPELINE_RUN: u64 = EPOCH_SLOTS;
 
 /// Helper trait expressing requirements for node types to be used in engine.
-pub trait EngineNodeTypes: ProviderNodeTypes + NodeTypesWithEngine {}
+pub trait EngineNodeTypes:
+    ProviderNodeTypes<Primitives = EthPrimitives> + NodeTypesWithEngine
+{
+}
 
-impl<T> EngineNodeTypes for T where T: ProviderNodeTypes + NodeTypesWithEngine {}
+impl<T> EngineNodeTypes for T where
+    T: ProviderNodeTypes<Primitives = EthPrimitives> + NodeTypesWithEngine
+{
+}
 
 /// Represents a pending forkchoice update.
 ///
@@ -228,9 +234,9 @@ impl<N, BT, Client> BeaconConsensusEngine<N, BT, Client>
 where
     N: EngineNodeTypes,
     BT: BlockchainTreeEngine
-        + BlockReader<Block = BlockTy<N>>
+        + BlockReader<Block = BlockTy<N>, Header = HeaderTy<N>>
         + BlockIdReader
-        + CanonChainTracker
+        + CanonChainTracker<Header = HeaderTy<N>>
         + StageCheckpointReader
         + ChainSpecProvider<ChainSpec = N::ChainSpec>
         + 'static,
@@ -1798,9 +1804,9 @@ where
     N: EngineNodeTypes,
     Client: EthBlockClient + 'static,
     BT: BlockchainTreeEngine
-        + BlockReader<Block = BlockTy<N>>
+        + BlockReader<Block = BlockTy<N>, Header = HeaderTy<N>>
         + BlockIdReader
-        + CanonChainTracker
+        + CanonChainTracker<Header = HeaderTy<N>>
         + StageCheckpointReader
         + ChainSpecProvider<ChainSpec = N::ChainSpec>
         + Unpin
@@ -2173,7 +2179,12 @@ mod tests {
 
     fn insert_blocks<
         'a,
-        N: ProviderNodeTypes<Primitives: FullNodePrimitives<BlockBody = reth_primitives::BlockBody>>,
+        N: ProviderNodeTypes<
+            Primitives: FullNodePrimitives<
+                BlockBody = reth_primitives::BlockBody,
+                BlockHeader = reth_primitives::Header,
+            >,
+        >,
     >(
         provider_factory: ProviderFactory<N>,
         mut blocks: impl Iterator<Item = &'a SealedBlock>,
@@ -2879,7 +2890,7 @@ mod tests {
             block1.header.set_difficulty(
                 MAINNET.fork(EthereumHardfork::Paris).ttd().unwrap() - U256::from(1),
             );
-            block1 = block1.unseal().seal_slow();
+            block1 = block1.unseal::<reth_primitives::Block>().seal_slow();
             let (block2, exec_result2) = data.blocks[1].clone();
             let mut block2 = block2.unseal().block;
             block2.body.withdrawals = None;
