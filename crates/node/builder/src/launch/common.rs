@@ -10,12 +10,11 @@ use crate::{
 use alloy_primitives::{BlockNumber, B256};
 use eyre::{Context, OptionExt};
 use rayon::ThreadPoolBuilder;
-use reth_beacon_consensus::EthBeaconConsensus;
 use reth_chainspec::{Chain, EthChainSpec, EthereumHardforks};
 use reth_config::{config::EtlConfig, PruneConfig};
-use reth_consensus::Consensus;
+use reth_consensus::noop::NoopConsensus;
 use reth_db_api::{database::Database, database_metrics::DatabaseMetrics};
-use reth_db_common::init::{init_genesis, InitDatabaseError};
+use reth_db_common::init::{init_genesis, InitStorageError};
 use reth_downloaders::{bodies::noop::NoopBodiesDownloader, headers::noop::NoopHeaderDownloader};
 use reth_engine_local::MiningMode;
 use reth_engine_tree::tree::{InvalidBlockHook, InvalidBlockHooks, NoopInvalidBlockHook};
@@ -23,7 +22,9 @@ use reth_evm::noop::NoopBlockExecutorProvider;
 use reth_fs_util as fs;
 use reth_invalid_block_hooks::InvalidBlockWitnessHook;
 use reth_network_p2p::headers::client::HeadersClient;
-use reth_node_api::{FullNodePrimitives, FullNodeTypes, NodeTypes, NodeTypesWithDB};
+use reth_node_api::{
+    FullNodePrimitives, FullNodeTypes, NodePrimitives, NodeTypes, NodeTypesWithDB,
+};
 use reth_node_core::{
     args::InvalidBlockHookType,
     dirs::{ChainPath, DataDirPath},
@@ -40,7 +41,7 @@ use reth_node_metrics::{
     server::{MetricServer, MetricServerConfig},
     version::VersionInfo,
 };
-use reth_primitives::Head;
+use reth_primitives::{Head, TransactionSigned};
 use reth_provider::{
     providers::{ProviderNodeTypes, StaticFileProvider},
     BlockHashReader, BlockNumReader, ChainSpecProvider, ProviderError, ProviderFactory,
@@ -382,7 +383,7 @@ where
     pub async fn create_provider_factory<N>(&self) -> eyre::Result<ProviderFactory<N>>
     where
         N: ProviderNodeTypes<DB = DB, ChainSpec = ChainSpec>,
-        N::Primitives: FullNodePrimitives<BlockBody = reth_primitives::BlockBody>,
+        N::Primitives: FullNodePrimitives<BlockHeader = reth_primitives::Header>,
     {
         let factory = ProviderFactory::new(
             self.right().clone(),
@@ -414,10 +415,10 @@ where
                 .add_stages(DefaultStages::new(
                     factory.clone(),
                     tip_rx,
-                    Arc::new(EthBeaconConsensus::new(self.chain_spec())),
+                    Arc::new(NoopConsensus::default()),
                     NoopHeaderDownloader::default(),
                     NoopBodiesDownloader::default(),
-                    NoopBlockExecutorProvider::default(),
+                    NoopBlockExecutorProvider::<N::Primitives>::default(),
                     self.toml_config().stages.clone(),
                     self.prune_modes(),
                 ))
@@ -449,7 +450,7 @@ where
     ) -> eyre::Result<LaunchContextWith<Attached<WithConfigs<ChainSpec>, ProviderFactory<N>>>>
     where
         N: ProviderNodeTypes<DB = DB, ChainSpec = ChainSpec>,
-        N::Primitives: FullNodePrimitives<BlockBody = reth_primitives::BlockBody>,
+        N::Primitives: FullNodePrimitives<BlockHeader = reth_primitives::Header>,
     {
         let factory = self.create_provider_factory().await?;
         let ctx = LaunchContextWith {
@@ -531,13 +532,13 @@ where
     }
 
     /// Convenience function to [`Self::init_genesis`]
-    pub fn with_genesis(self) -> Result<Self, InitDatabaseError> {
+    pub fn with_genesis(self) -> Result<Self, InitStorageError> {
         init_genesis(self.provider_factory())?;
         Ok(self)
     }
 
     /// Write the genesis block and state if it has not already been written
-    pub fn init_genesis(&self) -> Result<B256, InitDatabaseError> {
+    pub fn init_genesis(&self) -> Result<B256, InitStorageError> {
         init_genesis(self.provider_factory())
     }
 
@@ -673,7 +674,6 @@ where
         let components = components_builder.build_components(&builder_ctx).await?;
 
         let blockchain_db = self.blockchain_db().clone();
-        let consensus = Arc::new(components.consensus().clone());
 
         let node_adapter = NodeAdapter {
             components,
@@ -691,7 +691,6 @@ where
             },
             node_adapter,
             head,
-            consensus,
         };
 
         let ctx = LaunchContextWith {
@@ -847,11 +846,6 @@ where
         Ok(None)
     }
 
-    /// Returns the configured `Consensus`.
-    pub fn consensus(&self) -> Arc<dyn Consensus> {
-        self.right().consensus.clone()
-    }
-
     /// Returns the metrics sender.
     pub fn sync_metrics_tx(&self) -> UnboundedSender<MetricEvent> {
         self.right().db_provider_container.metrics_sender.clone()
@@ -868,11 +862,16 @@ impl<T, CB>
         Attached<WithConfigs<<T::Types as NodeTypes>::ChainSpec>, WithComponents<T, CB>>,
     >
 where
-    T: FullNodeTypes<Provider: StateProviderFactory + ChainSpecProvider, Types: ProviderNodeTypes>,
+    T: FullNodeTypes<
+        Provider: StateProviderFactory + ChainSpecProvider,
+        Types: ProviderNodeTypes<Primitives: NodePrimitives<SignedTx = TransactionSigned>>,
+    >,
     CB: NodeComponentsBuilder<T>,
 {
     /// Returns the [`InvalidBlockHook`] to use for the node.
-    pub fn invalid_block_hook(&self) -> eyre::Result<Box<dyn InvalidBlockHook>> {
+    pub fn invalid_block_hook(
+        &self,
+    ) -> eyre::Result<Box<dyn InvalidBlockHook<<T::Types as NodeTypes>::Primitives>>> {
         let Some(ref hook) = self.node_config().debug.invalid_block_hook else {
             return Ok(Box::new(NoopInvalidBlockHook::default()))
         };
@@ -896,7 +895,7 @@ where
                     InvalidBlockHookType::PreState | InvalidBlockHookType::Opcode => {
                         eyre::bail!("invalid block hook {hook:?} is not implemented yet")
                     }
-                } as Box<dyn InvalidBlockHook>)
+                } as Box<dyn InvalidBlockHook<_>>)
             })
             .collect::<Result<_, _>>()?;
 
@@ -918,6 +917,7 @@ where
                         alloy_rpc_types::Transaction,
                         alloy_rpc_types::Block,
                         alloy_rpc_types::Receipt,
+                        alloy_rpc_types::Header,
                     >::chain_id(&client)
                     .await
                 })?
@@ -1021,7 +1021,6 @@ where
     db_provider_container: WithMeteredProvider<T::Types>,
     node_adapter: NodeAdapter<T, CB::Components>,
     head: Head,
-    consensus: Arc<dyn Consensus>,
 }
 
 #[cfg(test)]

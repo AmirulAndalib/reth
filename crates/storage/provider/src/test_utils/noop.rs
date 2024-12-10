@@ -27,7 +27,9 @@ use reth_primitives::{
 };
 use reth_prune_types::{PruneCheckpoint, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
-use reth_storage_api::{StateProofProvider, StorageRootProvider};
+use reth_storage_api::{
+    HashedPostStateProvider, NodePrimitivesProvider, StateProofProvider, StorageRootProvider,
+};
 use reth_storage_errors::provider::ProviderResult;
 use reth_trie::{
     updates::TrieUpdates, AccountProof, HashedPostState, HashedStorage, MultiProof, TrieInput,
@@ -260,6 +262,7 @@ impl TransactionsProvider for NoopProvider {
 }
 
 impl ReceiptProvider for NoopProvider {
+    type Receipt = Receipt;
     fn receipt(&self, _id: TxNumber) -> ProviderResult<Option<Receipt>> {
         Ok(None)
     }
@@ -283,6 +286,8 @@ impl ReceiptProvider for NoopProvider {
 impl ReceiptProviderIdExt for NoopProvider {}
 
 impl HeaderProvider for NoopProvider {
+    type Header = Header;
+
     fn header(&self, _block_hash: &BlockHash) -> ProviderResult<Option<Header>> {
         Ok(None)
     }
@@ -372,6 +377,15 @@ impl StorageRootProvider for NoopProvider {
     ) -> ProviderResult<reth_trie::StorageProof> {
         Ok(reth_trie::StorageProof::new(slot))
     }
+
+    fn storage_multiproof(
+        &self,
+        _address: Address,
+        _slots: &[B256],
+        _hashed_storage: HashedStorage,
+    ) -> ProviderResult<reth_trie::StorageMultiProof> {
+        Ok(reth_trie::StorageMultiProof::empty())
+    }
 }
 
 impl StateProofProvider for NoopProvider {
@@ -401,6 +415,12 @@ impl StateProofProvider for NoopProvider {
     }
 }
 
+impl HashedPostStateProvider for NoopProvider {
+    fn hashed_post_state(&self, _bundle_state: &revm::db::BundleState) -> HashedPostState {
+        HashedPostState::default()
+    }
+}
+
 impl StateProvider for NoopProvider {
     fn storage(
         &self,
@@ -416,19 +436,6 @@ impl StateProvider for NoopProvider {
 }
 
 impl EvmEnvProvider for NoopProvider {
-    fn fill_env_at<EvmConfig>(
-        &self,
-        _cfg: &mut CfgEnvWithHandlerCfg,
-        _block_env: &mut BlockEnv,
-        _at: BlockHashOrNumber,
-        _evm_config: EvmConfig,
-    ) -> ProviderResult<()>
-    where
-        EvmConfig: ConfigureEvmEnv<Header = Header>,
-    {
-        Ok(())
-    }
-
     fn fill_env_with_header<EvmConfig>(
         &self,
         _cfg: &mut CfgEnvWithHandlerCfg,
@@ -559,9 +566,11 @@ impl PruneCheckpointReader for NoopProvider {
     }
 }
 
-impl StaticFileProviderFactory for NoopProvider {
+impl NodePrimitivesProvider for NoopProvider {
     type Primitives = EthPrimitives;
+}
 
+impl StaticFileProviderFactory for NoopProvider {
     fn static_file_provider(&self) -> StaticFileProvider<Self::Primitives> {
         StaticFileProvider::read_only(PathBuf::default(), false).unwrap()
     }
@@ -574,6 +583,8 @@ impl CanonStateSubscriptions for NoopProvider {
 }
 
 impl ForkChoiceSubscriptions for NoopProvider {
+    type Header = Header;
+
     fn subscribe_safe_block(&self) -> ForkChoiceNotifications {
         let (_, rx) = watch::channel(None);
         ForkChoiceNotifications(rx)
