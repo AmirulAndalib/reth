@@ -132,7 +132,11 @@ impl<Client, Pool, Tasks, Builder> BasicPayloadJobGenerator<Client, Pool, Tasks,
 impl<Client, Pool, Tasks, Builder> PayloadJobGenerator
     for BasicPayloadJobGenerator<Client, Pool, Tasks, Builder>
 where
-    Client: StateProviderFactory + BlockReaderIdExt + Clone + Unpin + 'static,
+    Client: StateProviderFactory
+        + BlockReaderIdExt<Header = alloy_consensus::Header>
+        + Clone
+        + Unpin
+        + 'static,
     Pool: TransactionPool + Unpin + 'static,
     Tasks: TaskSpawner + Clone + Unpin + 'static,
     Builder: PayloadBuilder<Pool, Client> + Unpin + 'static,
@@ -159,11 +163,7 @@ where
                 .ok_or_else(|| PayloadBuilderError::MissingParentHeader(attributes.parent()))?
         };
 
-        let config = PayloadConfig::new(
-            Arc::new(parent_header.clone()),
-            self.config.extradata.clone(),
-            attributes,
-        );
+        let config = PayloadConfig::new(Arc::new(parent_header.clone()), attributes);
 
         let until = self.job_deadline(config.attributes.timestamp());
         let deadline = Box::pin(tokio::time::sleep_until(until));
@@ -709,17 +709,8 @@ impl Drop for Cancelled {
 pub struct PayloadConfig<Attributes> {
     /// The parent header.
     pub parent_header: Arc<SealedHeader>,
-    /// Block extra data.
-    pub extra_data: Bytes,
     /// Requested attributes for the payload.
     pub attributes: Attributes,
-}
-
-impl<Attributes> PayloadConfig<Attributes> {
-    /// Returns an owned instance of the [`PayloadConfig`]'s `extra_data` bytes.
-    pub fn extra_data(&self) -> Bytes {
-        self.extra_data.clone()
-    }
 }
 
 impl<Attributes> PayloadConfig<Attributes>
@@ -727,12 +718,8 @@ where
     Attributes: PayloadBuilderAttributes,
 {
     /// Create new payload config.
-    pub const fn new(
-        parent_header: Arc<SealedHeader>,
-        extra_data: Bytes,
-        attributes: Attributes,
-    ) -> Self {
-        Self { parent_header, extra_data, attributes }
+    pub const fn new(parent_header: Arc<SealedHeader>, attributes: Attributes) -> Self {
+        Self { parent_header, attributes }
     }
 
     /// Returns the payload id.

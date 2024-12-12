@@ -12,7 +12,7 @@ use alloy_eips::{
 };
 use alloy_primitives::{
     keccak256,
-    map::{HashMap, HashSet},
+    map::{B256HashMap, HashMap},
     Address, BlockHash, BlockNumber, Bytes, StorageKey, StorageValue, TxHash, TxNumber, B256, U256,
 };
 use parking_lot::Mutex;
@@ -26,14 +26,16 @@ use reth_primitives::{
     Account, Block, BlockWithSenders, Bytecode, EthPrimitives, GotExpected, Receipt, SealedBlock,
     SealedBlockWithSenders, SealedHeader, TransactionMeta, TransactionSigned,
 };
+use reth_primitives_traits::SignedTransaction;
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_storage_api::{
-    DatabaseProviderFactory, StageCheckpointReader, StateProofProvider, StorageRootProvider,
+    DatabaseProviderFactory, HashedPostStateProvider, OmmersProvider, StageCheckpointReader,
+    StateCommitmentProvider, StateProofProvider, StorageRootProvider,
 };
 use reth_storage_errors::provider::{ConsistentViewError, ProviderError, ProviderResult};
 use reth_trie::{
-    updates::TrieUpdates, AccountProof, HashedPostState, HashedStorage, MultiProof, StorageProof,
-    TrieInput,
+    updates::TrieUpdates, AccountProof, HashedPostState, HashedStorage, MultiProof,
+    MultiProofTargets, StorageMultiProof, StorageProof, TrieInput,
 };
 use reth_trie_db::MerklePatriciaTrie;
 use revm::primitives::{BlockEnv, CfgEnvWithHandlerCfg};
@@ -163,6 +165,10 @@ impl NodeTypes for MockNode {
     type Storage = EthStorage;
 }
 
+impl StateCommitmentProvider for MockEthProvider {
+    type StateCommitment = <MockNode as NodeTypes>::StateCommitment;
+}
+
 impl DatabaseProviderFactory for MockEthProvider {
     type DB = DatabaseMock;
     type Provider = DatabaseProvider<TxMock, MockNode>;
@@ -178,6 +184,8 @@ impl DatabaseProviderFactory for MockEthProvider {
 }
 
 impl HeaderProvider for MockEthProvider {
+    type Header = Header;
+
     fn header(&self, block_hash: &BlockHash) -> ProviderResult<Option<Header>> {
         let lock = self.headers.lock();
         Ok(lock.get(block_hash).cloned())
@@ -378,6 +386,8 @@ impl TransactionsProvider for MockEthProvider {
 }
 
 impl ReceiptProvider for MockEthProvider {
+    type Receipt = Receipt;
+
     fn receipt(&self, _id: TxNumber) -> ProviderResult<Option<Receipt>> {
         Ok(None)
     }
@@ -497,10 +507,6 @@ impl BlockReader for MockEthProvider {
     }
 
     fn pending_block_and_receipts(&self) -> ProviderResult<Option<(SealedBlock, Vec<Receipt>)>> {
-        Ok(None)
-    }
-
-    fn ommers(&self, _id: BlockHashOrNumber) -> ProviderResult<Option<Vec<Header>>> {
         Ok(None)
     }
 
@@ -639,6 +645,15 @@ impl StorageRootProvider for MockEthProvider {
     ) -> ProviderResult<reth_trie::StorageProof> {
         Ok(StorageProof::new(slot))
     }
+
+    fn storage_multiproof(
+        &self,
+        _address: Address,
+        _slots: &[B256],
+        _hashed_storage: HashedStorage,
+    ) -> ProviderResult<StorageMultiProof> {
+        Ok(StorageMultiProof::empty())
+    }
 }
 
 impl StateProofProvider for MockEthProvider {
@@ -654,7 +669,7 @@ impl StateProofProvider for MockEthProvider {
     fn multiproof(
         &self,
         _input: TrieInput,
-        _targets: HashMap<B256, HashSet<B256>>,
+        _targets: MultiProofTargets,
     ) -> ProviderResult<MultiProof> {
         Ok(MultiProof::default())
     }
@@ -663,8 +678,14 @@ impl StateProofProvider for MockEthProvider {
         &self,
         _input: TrieInput,
         _target: HashedPostState,
-    ) -> ProviderResult<HashMap<B256, Bytes>> {
+    ) -> ProviderResult<B256HashMap<Bytes>> {
         Ok(HashMap::default())
+    }
+}
+
+impl HashedPostStateProvider for MockEthProvider {
+    fn hashed_post_state(&self, _state: &revm::db::BundleState) -> HashedPostState {
+        HashedPostState::default()
     }
 }
 
@@ -692,54 +713,15 @@ impl StateProvider for MockEthProvider {
 }
 
 impl EvmEnvProvider for MockEthProvider {
-    fn fill_env_at<EvmConfig>(
+    fn env_with_header<EvmConfig>(
         &self,
-        _cfg: &mut CfgEnvWithHandlerCfg,
-        _block_env: &mut BlockEnv,
-        _at: BlockHashOrNumber,
-        _evm_config: EvmConfig,
-    ) -> ProviderResult<()>
+        header: &Header,
+        evm_config: EvmConfig,
+    ) -> ProviderResult<(CfgEnvWithHandlerCfg, BlockEnv)>
     where
         EvmConfig: ConfigureEvmEnv<Header = Header>,
     {
-        Ok(())
-    }
-
-    fn fill_env_with_header<EvmConfig>(
-        &self,
-        _cfg: &mut CfgEnvWithHandlerCfg,
-        _block_env: &mut BlockEnv,
-        _header: &Header,
-        _evm_config: EvmConfig,
-    ) -> ProviderResult<()>
-    where
-        EvmConfig: ConfigureEvmEnv<Header = Header>,
-    {
-        Ok(())
-    }
-
-    fn fill_cfg_env_at<EvmConfig>(
-        &self,
-        _cfg: &mut CfgEnvWithHandlerCfg,
-        _at: BlockHashOrNumber,
-        _evm_config: EvmConfig,
-    ) -> ProviderResult<()>
-    where
-        EvmConfig: ConfigureEvmEnv<Header = Header>,
-    {
-        Ok(())
-    }
-
-    fn fill_cfg_env_with_header<EvmConfig>(
-        &self,
-        _cfg: &mut CfgEnvWithHandlerCfg,
-        _header: &Header,
-        _evm_config: EvmConfig,
-    ) -> ProviderResult<()>
-    where
-        EvmConfig: ConfigureEvmEnv<Header = Header>,
-    {
-        Ok(())
+        Ok(evm_config.cfg_and_block_env(header, U256::MAX))
     }
 }
 
@@ -808,6 +790,12 @@ impl WithdrawalsProvider for MockEthProvider {
     }
 }
 
+impl OmmersProvider for MockEthProvider {
+    fn ommers(&self, _id: BlockHashOrNumber) -> ProviderResult<Option<Vec<Header>>> {
+        Ok(None)
+    }
+}
+
 impl ChangeSetReader for MockEthProvider {
     fn account_block_changeset(
         &self,
@@ -818,6 +806,8 @@ impl ChangeSetReader for MockEthProvider {
 }
 
 impl StateReader for MockEthProvider {
+    type Receipt = Receipt;
+
     fn get_state(&self, _block: BlockNumber) -> ProviderResult<Option<ExecutionOutcome>> {
         Ok(None)
     }

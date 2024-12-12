@@ -1,6 +1,9 @@
 //! Command for debugging block building.
 use alloy_consensus::TxEip4844;
-use alloy_eips::{eip2718::Encodable2718, eip4844::BlobTransactionSidecar};
+use alloy_eips::{
+    eip2718::Encodable2718,
+    eip4844::{env_settings::EnvKzgSettings, BlobTransactionSidecar},
+};
 use alloy_primitives::{Address, Bytes, B256, U256};
 use alloy_rlp::Decodable;
 use alloy_rpc_types::engine::{BlobsBundleV1, PayloadAttributes};
@@ -17,15 +20,16 @@ use reth_chainspec::ChainSpec;
 use reth_cli::chainspec::ChainSpecParser;
 use reth_cli_commands::common::{AccessRights, CliNodeTypes, Environment, EnvironmentArgs};
 use reth_cli_runner::CliContext;
-use reth_consensus::Consensus;
+use reth_consensus::{Consensus, FullConsensus};
 use reth_errors::RethResult;
+use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_evm::execute::{BlockExecutorProvider, Executor};
 use reth_execution_types::ExecutionOutcome;
 use reth_fs_util as fs;
 use reth_node_api::{BlockTy, EngineApiMessageVersion, PayloadBuilderAttributes};
 use reth_node_ethereum::{EthEvmConfig, EthExecutorProvider};
 use reth_primitives::{
-    BlobTransaction, BlockExt, PooledTransactionsElement, SealedBlock, SealedBlockWithSenders,
+    BlobTransaction, BlockExt, PooledTransactionsElement, SealedBlockFor, SealedBlockWithSenders,
     SealedHeader, Transaction, TransactionSigned,
 };
 use reth_provider::{
@@ -33,11 +37,7 @@ use reth_provider::{
     BlockHashReader, BlockReader, BlockWriter, ChainSpecProvider, ProviderFactory,
     StageCheckpointReader, StateProviderFactory,
 };
-use reth_revm::{
-    cached::CachedReads,
-    database::StateProviderDatabase,
-    primitives::{EnvKzgSettings, KzgSettings},
-};
+use reth_revm::{cached::CachedReads, database::StateProviderDatabase, primitives::KzgSettings};
 use reth_stages::StageId;
 use reth_transaction_pool::{
     blobstore::InMemoryBlobStore, BlobStore, EthPooledTransaction, PoolConfig, TransactionOrigin,
@@ -90,7 +90,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
     fn lookup_best_block<N: ProviderNodeTypes<ChainSpec = C::ChainSpec>>(
         &self,
         factory: ProviderFactory<N>,
-    ) -> RethResult<Arc<SealedBlock>> {
+    ) -> RethResult<Arc<SealedBlockFor<BlockTy<N>>>> {
         let provider = factory.provider()?;
 
         let best_number =
@@ -128,7 +128,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
     ) -> eyre::Result<()> {
         let Environment { provider_factory, .. } = self.env.init::<N>(AccessRights::RW)?;
 
-        let consensus: Arc<dyn Consensus> =
+        let consensus: Arc<dyn FullConsensus> =
             Arc::new(EthBeaconConsensus::new(provider_factory.chain_spec()));
 
         let executor = EthExecutorProvider::ethereum(provider_factory.chain_spec());
@@ -224,10 +224,11 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
             suggested_fee_recipient: self.suggested_fee_recipient,
             // TODO: add support for withdrawals
             withdrawals: None,
+            target_blobs_per_block: None,
+            max_blobs_per_block: None,
         };
         let payload_config = PayloadConfig::new(
             Arc::new(SealedHeader::new(best_block.header().clone(), best_block.hash())),
-            Bytes::default(),
             reth_payload_builder::EthPayloadBuilderAttributes::try_new(
                 best_block.hash(),
                 payload_attrs,
@@ -246,6 +247,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
 
         let payload_builder = reth_ethereum_payload_builder::EthereumPayloadBuilder::new(
             EthEvmConfig::new(provider_factory.chain_spec()),
+            EthereumBuilderConfig::new(Default::default()),
         );
 
         match payload_builder.try_build(args)? {
@@ -261,7 +263,8 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
                 let block_with_senders =
                     SealedBlockWithSenders::<BlockTy<N>>::new(block.clone(), senders).unwrap();
 
-                let db = StateProviderDatabase::new(blockchain_db.latest()?);
+                let state_provider = blockchain_db.latest()?;
+                let db = StateProviderDatabase::new(&state_provider);
                 let executor =
                     EthExecutorProvider::ethereum(provider_factory.chain_spec()).executor(db);
 
@@ -271,7 +274,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
                     ExecutionOutcome::from((block_execution_output, block.number));
                 debug!(target: "reth::cli", ?execution_outcome, "Executed block");
 
-                let hashed_post_state = execution_outcome.hash_state_slow();
+                let hashed_post_state = state_provider.hashed_post_state(execution_outcome.state());
                 let (state_root, trie_updates) = StateRoot::overlay_root_with_updates(
                     provider_factory.provider()?.tx_ref(),
                     hashed_post_state.clone(),
