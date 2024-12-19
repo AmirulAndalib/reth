@@ -9,7 +9,7 @@ use alloy_primitives::BlockNumber;
 use reth_evm::execute::{
     BatchExecutor, BlockExecutionError, BlockExecutionOutput, BlockExecutorProvider, Executor,
 };
-use reth_node_api::{Block as _, BlockBody as _};
+use reth_node_api::{Block as _, BlockBody as _, NodePrimitives};
 use reth_primitives::{BlockExt, BlockWithSenders, Receipt};
 use reth_primitives_traits::{format_gas_throughput, SignedTransaction};
 use reth_provider::{
@@ -25,7 +25,8 @@ pub(super) type BackfillJobResult<T> = Result<T, BlockExecutionError>;
 /// Backfill job started for a specific range.
 ///
 /// It implements [`Iterator`] that executes blocks in batches according to the provided thresholds
-/// and yields [`Chain`]
+/// and yields [`Chain`]. In other words, this iterator can yield multiple items for the given range
+/// depending on the configured thresholds.
 #[derive(Debug)]
 pub struct BackfillJob<E, P> {
     pub(crate) executor: E,
@@ -38,12 +39,10 @@ pub struct BackfillJob<E, P> {
 
 impl<E, P> Iterator for BackfillJob<E, P>
 where
-    E: BlockExecutorProvider,
-    P: HeaderProvider
-        + BlockReader<Transaction: SignedTransaction, Block = reth_primitives::Block>
-        + StateProviderFactory,
+    E: BlockExecutorProvider<Primitives: NodePrimitives<Block = P::Block>>,
+    P: HeaderProvider + BlockReader<Transaction: SignedTransaction> + StateProviderFactory,
 {
-    type Item = BackfillJobResult<Chain>;
+    type Item = BackfillJobResult<Chain<E::Primitives>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.range.is_empty() {
@@ -56,10 +55,8 @@ where
 
 impl<E, P> BackfillJob<E, P>
 where
-    E: BlockExecutorProvider,
-    P: BlockReader<Transaction: SignedTransaction, Block = reth_primitives::Block>
-        + HeaderProvider
-        + StateProviderFactory,
+    E: BlockExecutorProvider<Primitives: NodePrimitives<Block = P::Block>>,
+    P: BlockReader<Transaction: SignedTransaction> + HeaderProvider + StateProviderFactory,
 {
     /// Converts the backfill job into a single block backfill job.
     pub fn into_single_blocks(self) -> SingleBlockBackfillJob<E, P> {
@@ -67,11 +64,11 @@ where
     }
 
     /// Converts the backfill job into a stream.
-    pub fn into_stream(self) -> StreamBackfillJob<E, P, Chain> {
+    pub fn into_stream(self) -> StreamBackfillJob<E, P, Chain<E::Primitives>> {
         self.into()
     }
 
-    fn execute_range(&mut self) -> BackfillJobResult<Chain> {
+    fn execute_range(&mut self) -> BackfillJobResult<Chain<E::Primitives>> {
         debug!(
             target: "exex::backfill",
             range = ?self.range,
@@ -125,7 +122,7 @@ where
             // TODO(alexey): report gas metrics using `block.header.gas_used`
 
             // Seal the block back and save it
-            blocks.push(block.seal(hash));
+            blocks.push(block.seal_unchecked(hash));
 
             // Check if we should commit now
             let bundle_size_hint = executor.size_hint().unwrap_or_default() as u64;
@@ -169,10 +166,13 @@ pub struct SingleBlockBackfillJob<E, P> {
 
 impl<E, P> Iterator for SingleBlockBackfillJob<E, P>
 where
-    E: BlockExecutorProvider,
-    P: HeaderProvider + BlockReader<Block = reth_primitives::Block> + StateProviderFactory,
+    E: BlockExecutorProvider<Primitives: NodePrimitives<Block = P::Block>>,
+    P: HeaderProvider + BlockReader + StateProviderFactory,
 {
-    type Item = BackfillJobResult<(BlockWithSenders, BlockExecutionOutput<Receipt>)>;
+    type Item = BackfillJobResult<(
+        BlockWithSenders<P::Block>,
+        BlockExecutionOutput<<E::Primitives as NodePrimitives>::Receipt>,
+    )>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.range.next().map(|block_number| self.execute_block(block_number))
@@ -181,8 +181,8 @@ where
 
 impl<E, P> SingleBlockBackfillJob<E, P>
 where
-    E: BlockExecutorProvider,
-    P: HeaderProvider + BlockReader<Block = reth_primitives::Block> + StateProviderFactory,
+    E: BlockExecutorProvider<Primitives: NodePrimitives<Block = P::Block>>,
+    P: HeaderProvider + BlockReader + StateProviderFactory,
 {
     /// Converts the single block backfill job into a stream.
     pub fn into_stream(
@@ -191,10 +191,14 @@ where
         self.into()
     }
 
+    #[expect(clippy::type_complexity)]
     pub(crate) fn execute_block(
         &self,
         block_number: u64,
-    ) -> BackfillJobResult<(BlockWithSenders<P::Block>, BlockExecutionOutput<Receipt>)> {
+    ) -> BackfillJobResult<(
+        BlockWithSenders<P::Block>,
+        BlockExecutionOutput<<E::Primitives as NodePrimitives>::Receipt>,
+    )> {
         let td = self
             .provider
             .header_td_by_number(block_number)?
