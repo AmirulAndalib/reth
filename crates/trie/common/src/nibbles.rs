@@ -1,24 +1,10 @@
-use bytes::Buf;
+use alloc::vec::Vec;
 use derive_more::Deref;
-use reth_codecs::Compact;
-use serde::{Deserialize, Serialize};
-
 pub use nybbles::Nibbles;
 
 /// The representation of nibbles of the merkle trie stored in the database.
-#[derive(
-    Clone,
-    Debug,
-    Default,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    Serialize,
-    Deserialize,
-    derive_more::Index,
-)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, derive_more::Index)]
+#[cfg_attr(any(test, feature = "serde"), derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "test-utils", derive(arbitrary::Arbitrary))]
 pub struct StoredNibbles(pub Nibbles);
 
@@ -45,7 +31,7 @@ impl PartialEq<[u8]> for StoredNibbles {
 
 impl PartialOrd<[u8]> for StoredNibbles {
     #[inline]
-    fn partial_cmp(&self, other: &[u8]) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &[u8]) -> Option<core::cmp::Ordering> {
         self.0.as_slice().partial_cmp(other)
     }
 }
@@ -57,7 +43,8 @@ impl core::borrow::Borrow<[u8]> for StoredNibbles {
     }
 }
 
-impl Compact for StoredNibbles {
+#[cfg(any(test, feature = "reth-codec"))]
+impl reth_codecs::Compact for StoredNibbles {
     fn to_compact<B>(&self, buf: &mut B) -> usize
     where
         B: bytes::BufMut + AsMut<[u8]>,
@@ -67,6 +54,8 @@ impl Compact for StoredNibbles {
     }
 
     fn from_compact(mut buf: &[u8], len: usize) -> (Self, &[u8]) {
+        use bytes::Buf;
+
         let nibbles = &buf[..len];
         buf.advance(len);
         (Self(Nibbles::from_nibbles_unchecked(nibbles)), buf)
@@ -74,7 +63,8 @@ impl Compact for StoredNibbles {
 }
 
 /// The representation of nibbles of the merkle trie stored in the database.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord, Hash, Deref)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deref)]
+#[cfg_attr(any(test, feature = "serde"), derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "test-utils", derive(arbitrary::Arbitrary))]
 pub struct StoredNibblesSubKey(pub Nibbles);
 
@@ -99,7 +89,8 @@ impl From<StoredNibblesSubKey> for Nibbles {
     }
 }
 
-impl Compact for StoredNibblesSubKey {
+#[cfg(any(test, feature = "reth-codec"))]
+impl reth_codecs::Compact for StoredNibblesSubKey {
     fn to_compact<B>(&self, buf: &mut B) -> usize
     where
         B: bytes::BufMut + AsMut<[u8]>,
@@ -125,6 +116,7 @@ impl Compact for StoredNibblesSubKey {
 mod tests {
     use super::*;
     use bytes::BytesMut;
+    use reth_codecs::Compact;
 
     #[test]
     fn test_stored_nibbles_from_nibbles() {

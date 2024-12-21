@@ -5,9 +5,7 @@ use alloy_genesis::{Genesis, GenesisAccount};
 use alloy_primitives::{b256, Address, TxKind, U256};
 use eyre::OptionExt;
 use reth_chainspec::{ChainSpec, ChainSpecBuilder, EthereumHardfork, MAINNET, MIN_TRANSACTION_GAS};
-use reth_evm::execute::{
-    BatchExecutor, BlockExecutionInput, BlockExecutionOutput, BlockExecutorProvider, Executor,
-};
+use reth_evm::execute::{BatchExecutor, BlockExecutionOutput, BlockExecutorProvider, Executor};
 use reth_evm_ethereum::execute::EthExecutorProvider;
 use reth_node_api::FullNodePrimitives;
 use reth_primitives::{
@@ -62,6 +60,7 @@ where
         Primitives: FullNodePrimitives<
             Block = reth_primitives::Block,
             BlockBody = reth_primitives::BlockBody,
+            Receipt = reth_primitives::Receipt,
         >,
     >,
 {
@@ -70,7 +69,7 @@ where
     // Execute the block to produce a block execution output
     let mut block_execution_output = EthExecutorProvider::ethereum(chain_spec)
         .executor(StateProviderDatabase::new(LatestStateProviderRef::new(&provider)))
-        .execute(BlockExecutionInput { block, total_difficulty: U256::ZERO })?;
+        .execute(block)?;
     block_execution_output.state.reverts.sort();
 
     // Convert the block execution output to an execution outcome for committing to the database
@@ -171,6 +170,7 @@ where
         Primitives: FullNodePrimitives<
             Block = reth_primitives::Block,
             BlockBody = reth_primitives::BlockBody,
+            Receipt = reth_primitives::Receipt,
         >,
     >,
 {
@@ -194,7 +194,8 @@ pub(crate) fn blocks_and_execution_outcome<N>(
 ) -> eyre::Result<(Vec<SealedBlockWithSenders>, ExecutionOutcome)>
 where
     N: ProviderNodeTypes,
-    N::Primitives: FullNodePrimitives<Block = reth_primitives::Block>,
+    N::Primitives:
+        FullNodePrimitives<Block = reth_primitives::Block, Receipt = reth_primitives::Receipt>,
 {
     let (block1, block2) = blocks(chain_spec.clone(), key_pair)?;
 
@@ -203,10 +204,7 @@ where
     let executor = EthExecutorProvider::ethereum(chain_spec)
         .batch_executor(StateProviderDatabase::new(LatestStateProviderRef::new(&provider)));
 
-    let mut execution_outcome = executor.execute_and_verify_batch(vec![
-        (&block1, U256::ZERO).into(),
-        (&block2, U256::ZERO).into(),
-    ])?;
+    let mut execution_outcome = executor.execute_and_verify_batch(vec![&block1, &block2])?;
     execution_outcome.state_mut().reverts.sort();
 
     let block1 = block1.seal_slow();
