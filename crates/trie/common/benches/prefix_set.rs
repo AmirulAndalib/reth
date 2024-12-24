@@ -1,17 +1,17 @@
 #![allow(missing_docs, unreachable_pub)]
 use criterion::{
-    black_box, criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, Criterion,
+    criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, Criterion,
 };
 use proptest::{
     prelude::*,
     strategy::ValueTree,
     test_runner::{basic_result_cache, TestRunner},
 };
-use reth_trie::{
+use reth_trie_common::{
     prefix_set::{PrefixSet, PrefixSetMut},
     Nibbles,
 };
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, hint::black_box};
 
 /// Abstraction for aggregating nibbles and freezing it to a type
 /// that can be later used for benching.
@@ -48,28 +48,38 @@ pub fn prefix_set_lookups(c: &mut Criterion) {
     let mut group = c.benchmark_group("Prefix Set Lookups");
 
     for size in [10, 100, 1_000, 10_000] {
+        // Too slow.
+        #[allow(unexpected_cfgs)]
+        if cfg!(codspeed) && size > 1_000 {
+            continue;
+        }
+
         let test_data = generate_test_data(size);
 
         use implementations::*;
         prefix_set_bench::<BTreeAnyPrefixSet>(
             &mut group,
-            "`BTreeSet` with `Iterator::any` lookup",
+            "`BTreeSet` with `Iterator:any` lookup",
             test_data.clone(),
+            size,
         );
         prefix_set_bench::<BTreeRangeLastCheckedPrefixSet>(
             &mut group,
-            "`BTreeSet` with `BTreeSet::range` lookup",
+            "`BTreeSet` with `BTreeSet:range` lookup",
             test_data.clone(),
+            size,
         );
         prefix_set_bench::<VecCursorPrefixSet>(
             &mut group,
             "`Vec` with custom cursor lookup",
             test_data.clone(),
+            size,
         );
         prefix_set_bench::<VecBinarySearchPrefixSet>(
             &mut group,
             "`Vec` with binary search lookup",
             test_data.clone(),
+            size,
         );
     }
 }
@@ -78,6 +88,7 @@ fn prefix_set_bench<T>(
     group: &mut BenchmarkGroup<'_, WallTime>,
     description: &str,
     (preload, input, expected): (Vec<Nibbles>, Vec<Nibbles>, Vec<bool>),
+    size: usize,
 ) where
     T: PrefixSetMutAbstraction,
     T::Frozen: PrefixSetAbstraction,
@@ -90,12 +101,7 @@ fn prefix_set_bench<T>(
         (prefix_set.freeze(), input.clone(), expected.clone())
     };
 
-    let group_id = format!(
-        "prefix set | preload size: {} | input size: {} | {}",
-        preload.len(),
-        input.len(),
-        description
-    );
+    let group_id = format!("prefix set | size: {size} | {description}");
     group.bench_function(group_id, |b| {
         b.iter_with_setup(setup, |(mut prefix_set, input, expected)| {
             for (idx, key) in input.into_iter().enumerate() {
@@ -114,12 +120,12 @@ fn generate_test_data(size: usize) -> (Vec<Nibbles>, Vec<Nibbles>, Vec<bool>) {
 
     let vec_of_nibbles = |range| vec(any_with::<Nibbles>(range), size);
     let mut preload = vec_of_nibbles(32usize.into()).new_tree(&mut runner).unwrap().current();
-    preload.dedup();
     preload.sort();
+    preload.dedup();
 
     let mut input = vec_of_nibbles((0..=32usize).into()).new_tree(&mut runner).unwrap().current();
-    input.dedup();
     input.sort();
+    input.dedup();
 
     let expected = input
         .iter()

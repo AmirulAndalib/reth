@@ -6,7 +6,7 @@ use crate::{
     helpers::estimate::EstimateCall, FromEthApiError, FromEvmError, FullEthApiTypes,
     IntoEthApiError, RpcBlock, RpcNodeCore,
 };
-use alloy_consensus::{BlockHeader, Header};
+use alloy_consensus::BlockHeader;
 use alloy_eips::{eip1559::calc_next_block_base_fee, eip2930::AccessListResult};
 use alloy_primitives::{Address, Bytes, TxKind, B256, U256};
 use alloy_rpc_types_eth::{
@@ -17,10 +17,10 @@ use alloy_rpc_types_eth::{
 };
 use futures::Future;
 use reth_chainspec::EthChainSpec;
-use reth_evm::{ConfigureEvm, ConfigureEvmEnv};
+use reth_evm::{env::EvmEnv, ConfigureEvm, ConfigureEvmEnv};
 use reth_node_api::BlockBody;
-use reth_primitives::TransactionSigned;
-use reth_provider::{BlockIdReader, ChainSpecProvider, HeaderProvider};
+use reth_primitives_traits::SignedTransaction;
+use reth_provider::{BlockIdReader, ChainSpecProvider, ProviderHeader};
 use reth_revm::{
     database::StateProviderDatabase,
     db::CacheDB,
@@ -48,7 +48,7 @@ pub type SimulatedBlocksResult<N, E> = Result<Vec<SimulatedBlock<RpcBlock<N>>>, 
 
 /// Execution related functions for the [`EthApiServer`](crate::EthApiServer) trait in
 /// the `eth_` namespace.
-pub trait EthCall: EstimateCall + Call + LoadPendingBlock {
+pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthApiTypes {
     /// Estimate gas needed for execution of the `request` at the [`BlockId`].
     fn estimate_gas_at(
         &self,
@@ -68,10 +68,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock {
         &self,
         payload: SimulatePayload,
         block: Option<BlockId>,
-    ) -> impl Future<Output = SimulatedBlocksResult<Self::NetworkTypes, Self::Error>> + Send
-    where
-        Self: LoadBlock + FullEthApiTypes,
-    {
+    ) -> impl Future<Output = SimulatedBlocksResult<Self::NetworkTypes, Self::Error>> + Send {
         async move {
             if payload.block_state_calls.len() > self.max_simulate_blocks() as usize {
                 return Err(EthApiError::InvalidParams("too many blocks.".to_string()).into())
@@ -89,32 +86,29 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock {
             }
 
             // Build cfg and block env, we'll reuse those.
-            let (mut cfg, mut block_env, block) =
-                self.evm_env_at(block.unwrap_or_default()).await?;
+            let (evm_env, block) = self.evm_env_at(block.unwrap_or_default()).await?;
+            let EvmEnv { mut cfg_env_with_handler_cfg, mut block_env } = evm_env;
 
             // Gas cap for entire operation
             let total_gas_limit = self.call_gas_limit();
 
             let base_block =
                 self.block_with_senders(block).await?.ok_or(EthApiError::HeaderNotFound(block))?;
-            let mut parent_hash = base_block.header.hash();
-            let total_difficulty = RpcNodeCore::provider(self)
-                .header_td_by_number(block_env.number.to())
-                .map_err(Self::Error::from_eth_err)?
-                .ok_or(EthApiError::HeaderNotFound(block))?;
+            let mut parent_hash = base_block.hash();
 
             // Only enforce base fee if validation is enabled
-            cfg.disable_base_fee = !validation;
+            cfg_env_with_handler_cfg.disable_base_fee = !validation;
             // Always disable EIP-3607
-            cfg.disable_eip3607 = true;
+            cfg_env_with_handler_cfg.disable_eip3607 = true;
 
             let this = self.clone();
             self.spawn_with_state_at_block(block, move |state| {
                 let mut db = CacheDB::new(StateProviderDatabase::new(state));
+                let mut gas_used = 0;
                 let mut blocks: Vec<SimulatedBlock<RpcBlock<Self::NetworkTypes>>> =
                     Vec::with_capacity(block_state_calls.len());
-                let mut gas_used = 0;
-                for block in block_state_calls {
+                let mut block_state_calls = block_state_calls.into_iter().peekable();
+                while let Some(block) = block_state_calls.next() {
                     // Increase number and timestamp for every new block
                     block_env.number += U256::from(1);
                     block_env.timestamp += U256::from(1);
@@ -142,7 +136,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock {
                         block_env.basefee = U256::ZERO;
                     }
 
-                    let SimBlock { block_overrides, state_overrides, mut calls } = block;
+                    let SimBlock { block_overrides, state_overrides, calls } = block;
 
                     if let Some(block_overrides) = block_overrides {
                         apply_block_overrides(block_overrides, &mut db, &mut block_env);
@@ -157,20 +151,51 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock {
                         )
                     }
 
-                    // Resolve transactions, populate missing fields and enforce calls correctness.
-                    let transactions = simulate::resolve_transactions(
-                        &mut calls,
-                        validation,
-                        block_env.gas_limit.to(),
-                        cfg.chain_id,
-                        &mut db,
-                    )?;
+                    let default_gas_limit = {
+                        let total_specified_gas = calls.iter().filter_map(|tx| tx.gas).sum::<u64>();
+                        let txs_without_gas_limit =
+                            calls.iter().filter(|tx| tx.gas.is_none()).count();
+
+                        if total_specified_gas > block_env.gas_limit.to() {
+                            return Err(EthApiError::Other(Box::new(
+                                EthSimulateError::BlockGasLimitExceeded,
+                            ))
+                            .into())
+                        }
+
+                        if txs_without_gas_limit > 0 {
+                            (block_env.gas_limit.to::<u64>() - total_specified_gas) /
+                                txs_without_gas_limit as u64
+                        } else {
+                            0
+                        }
+                    };
 
                     let mut calls = calls.into_iter().peekable();
+                    let mut transactions = Vec::with_capacity(calls.len());
+                    let mut senders = Vec::with_capacity(calls.len());
                     let mut results = Vec::with_capacity(calls.len());
 
-                    while let Some(tx) = calls.next() {
-                        let env = this.build_call_evm_env(cfg.clone(), block_env.clone(), tx)?;
+                    while let Some(call) = calls.next() {
+                        let sender = call.from.unwrap_or_default();
+
+                        // Resolve transaction, populate missing fields and enforce calls
+                        // correctness.
+                        let tx = simulate::resolve_transaction(
+                            call,
+                            validation,
+                            default_gas_limit,
+                            cfg_env_with_handler_cfg.chain_id,
+                            &mut db,
+                            this.tx_resp_builder(),
+                        )?;
+
+                        let tx_env = this.evm_config().tx_env(&tx, sender);
+                        let env = EnvWithHandlerCfg::new_with_cfg_env(
+                            cfg_env_with_handler_cfg.clone(),
+                            block_env.clone(),
+                            tx_env,
+                        );
 
                         let (res, env) = {
                             if trace_transfers {
@@ -184,25 +209,33 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock {
                             }
                         };
 
-                        if calls.peek().is_some() {
+                        if calls.peek().is_some() || block_state_calls.peek().is_some() {
                             // need to apply the state changes of this call before executing the
                             // next call
                             db.commit(res.state);
                         }
 
-                        results.push((env.tx.caller, res.result));
+                        transactions.push(tx);
+                        senders.push(env.tx.caller);
+                        results.push(res.result);
                     }
 
+                    let (block, _) = this.assemble_block_and_receipts(
+                        &block_env,
+                        parent_hash,
+                        // state root calculation is skipped for performance reasons
+                        B256::ZERO,
+                        transactions,
+                        results.clone(),
+                    );
+
                     let block: SimulatedBlock<RpcBlock<Self::NetworkTypes>> =
-                        simulate::build_block(
+                        simulate::build_simulated_block(
+                            senders,
                             results,
-                            transactions,
-                            &block_env,
-                            parent_hash,
-                            total_difficulty,
                             return_full_transactions,
-                            &db,
                             this.tx_resp_builder(),
+                            block,
                         )?;
 
                     parent_hash = block.inner.header.hash;
@@ -239,10 +272,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock {
         bundle: Bundle,
         state_context: Option<StateContext>,
         mut state_override: Option<StateOverride>,
-    ) -> impl Future<Output = Result<Vec<EthCallResponse>, Self::Error>> + Send
-    where
-        Self: LoadBlock,
-    {
+    ) -> impl Future<Output = Result<Vec<EthCallResponse>, Self::Error>> + Send {
         async move {
             let Bundle { transactions, block_override } = bundle;
             if transactions.is_empty() {
@@ -269,10 +299,11 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock {
                     .into();
             }
 
-            let ((cfg, block_env, _), block) = futures::try_join!(
+            let ((evm_env, _), block) = futures::try_join!(
                 self.evm_env_at(target_block),
                 self.block_with_senders(target_block)
             )?;
+            let EvmEnv { cfg_env_with_handler_cfg, block_env } = evm_env;
 
             let block = block.ok_or(EthApiError::HeaderNotFound(target_block))?;
 
@@ -303,7 +334,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock {
                     let transactions = block.transactions_with_sender().take(num_txs);
                     for (signer, tx) in transactions {
                         let env = EnvWithHandlerCfg::new_with_cfg_env(
-                            cfg.clone(),
+                            cfg_env_with_handler_cfg.clone(),
                             block_env.clone(),
                             RpcNodeCore::evm_config(&this).tx_env(tx, *signer),
                         );
@@ -321,7 +352,13 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock {
                     let overrides = EvmOverrides::new(state_overrides, block_overrides.clone());
 
                     let env = this
-                        .prepare_call_env(cfg.clone(), block_env.clone(), tx, &mut db, overrides)
+                        .prepare_call_env(
+                            cfg_env_with_handler_cfg.clone(),
+                            block_env.clone(),
+                            tx,
+                            &mut db,
+                            overrides,
+                        )
                         .map(Into::into)?;
                     let (res, _) = this.transact(&mut db, env)?;
 
@@ -362,10 +399,11 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock {
     {
         async move {
             let block_id = block_number.unwrap_or_default();
-            let (cfg, block, at) = self.evm_env_at(block_id).await?;
+            let (evm_env, at) = self.evm_env_at(block_id).await?;
+            let EvmEnv { cfg_env_with_handler_cfg, block_env } = evm_env;
 
             self.spawn_blocking_io(move |this| {
-                this.create_access_list_with(cfg, block, at, request)
+                this.create_access_list_with(cfg_env_with_handler_cfg, block_env, at, request)
             })
             .await
         }
@@ -457,7 +495,9 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock {
 }
 
 /// Executes code on state.
-pub trait Call: LoadState<Evm: ConfigureEvm<Header = Header>> + SpawnBlocking {
+pub trait Call:
+    LoadState<Evm: ConfigureEvm<Header = ProviderHeader<Self::Provider>>> + SpawnBlocking
+{
     /// Returns default gas limit to use for `eth_call` and tracing RPC methods.
     ///
     /// Data access in default trait method implementations.
@@ -570,14 +610,21 @@ pub trait Call: LoadState<Evm: ConfigureEvm<Header = Header>> + SpawnBlocking {
         R: Send + 'static,
     {
         async move {
-            let (cfg, block_env, at) = self.evm_env_at(at).await?;
+            let (evm_env, at) = self.evm_env_at(at).await?;
+            let EvmEnv { cfg_env_with_handler_cfg, block_env } = evm_env;
             let this = self.clone();
             self.spawn_blocking_io(move |_| {
                 let state = this.state_at_block_id(at)?;
                 let mut db =
                     CacheDB::new(StateProviderDatabase::new(StateProviderTraitObjWrapper(&state)));
 
-                let env = this.prepare_call_env(cfg, block_env, request, &mut db, overrides)?;
+                let env = this.prepare_call_env(
+                    cfg_env_with_handler_cfg,
+                    block_env,
+                    request,
+                    &mut db,
+                    overrides,
+                )?;
 
                 f(StateCacheDbRefMutWrapper(&mut db), env)
             })
@@ -600,7 +647,7 @@ pub trait Call: LoadState<Evm: ConfigureEvm<Header = Header>> + SpawnBlocking {
         f: F,
     ) -> impl Future<Output = Result<Option<R>, Self::Error>> + Send
     where
-        Self: LoadBlock + LoadPendingBlock + LoadTransaction,
+        Self: LoadBlock + LoadTransaction,
         F: FnOnce(TransactionInfo, ResultAndState, StateCacheDb<'_>) -> Result<R, Self::Error>
             + Send
             + 'static,
@@ -613,11 +660,12 @@ pub trait Call: LoadState<Evm: ConfigureEvm<Header = Header>> + SpawnBlocking {
             };
             let (tx, tx_info) = transaction.split();
 
-            let (cfg, block_env, _) = self.evm_env_at(block.hash().into()).await?;
+            let (evm_env, _) = self.evm_env_at(block.hash().into()).await?;
+            let EvmEnv { cfg_env_with_handler_cfg, block_env } = evm_env;
 
             // we need to get the state of the parent block because we're essentially replaying the
             // block the transaction is included in
-            let parent_block = block.parent_hash;
+            let parent_block = block.parent_hash();
 
             let this = self.clone();
             self.spawn_with_state_at_block(parent_block.into(), move |state| {
@@ -627,14 +675,14 @@ pub trait Call: LoadState<Evm: ConfigureEvm<Header = Header>> + SpawnBlocking {
                 // replay all transactions prior to the targeted transaction
                 this.replay_transactions_until(
                     &mut db,
-                    cfg.clone(),
+                    cfg_env_with_handler_cfg.clone(),
                     block_env.clone(),
                     block_txs,
-                    tx.hash(),
+                    *tx.tx_hash(),
                 )?;
 
                 let env = EnvWithHandlerCfg::new_with_cfg_env(
-                    cfg,
+                    cfg_env_with_handler_cfg,
                     block_env,
                     RpcNodeCore::evm_config(&this).tx_env(tx.as_signed(), tx.signer()),
                 );
@@ -665,14 +713,15 @@ pub trait Call: LoadState<Evm: ConfigureEvm<Header = Header>> + SpawnBlocking {
     where
         DB: Database + DatabaseCommit,
         EthApiError: From<DB::Error>,
-        I: IntoIterator<Item = (&'a Address, &'a TransactionSigned)>,
+        I: IntoIterator<Item = (&'a Address, &'a <Self::Evm as ConfigureEvmEnv>::Transaction)>,
+        <Self::Evm as ConfigureEvmEnv>::Transaction: SignedTransaction,
     {
         let env = EnvWithHandlerCfg::new_with_cfg_env(cfg, block_env, Default::default());
 
         let mut evm = self.evm_config().evm_with_env(db, env);
         let mut index = 0;
         for (sender, tx) in transactions {
-            if tx.hash() == target_tx_hash {
+            if *tx.tx_hash() == target_tx_hash {
                 // reached the target transaction
                 break
             }

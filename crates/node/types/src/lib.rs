@@ -19,7 +19,7 @@ use reth_db_api::{
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
     Database,
 };
-use reth_engine_primitives::EngineTypes;
+use reth_engine_primitives::{BuiltPayload, EngineTypes};
 use reth_trie_db::StateCommitment;
 
 /// The type that configures the essential types of an Ethereum-like node.
@@ -31,7 +31,7 @@ pub trait NodeTypes: Send + Sync + Unpin + 'static {
     /// The node's primitive types, defining basic operations and structures.
     type Primitives: NodePrimitives;
     /// The type used for configuration of the EVM.
-    type ChainSpec: EthChainSpec;
+    type ChainSpec: EthChainSpec<Header = <Self::Primitives as NodePrimitives>::BlockHeader>;
     /// The type used to perform state commitment operations.
     type StateCommitment: StateCommitment;
     /// The type responsible for writing chain primitives to storage.
@@ -41,7 +41,7 @@ pub trait NodeTypes: Send + Sync + Unpin + 'static {
 /// The type that configures an Ethereum-like node with an engine for consensus.
 pub trait NodeTypesWithEngine: NodeTypes {
     /// The node's engine types, defining the interaction with the consensus engine.
-    type Engine: EngineTypes;
+    type Engine: EngineTypes<BuiltPayload: BuiltPayload<Primitives = Self::Primitives>>;
 }
 
 /// A helper trait that is downstream of the [`NodeTypesWithEngine`] trait and adds database to the
@@ -151,7 +151,7 @@ impl<P, C, SC, S> AnyNodeTypes<P, C, SC, S> {
 impl<P, C, SC, S> NodeTypes for AnyNodeTypes<P, C, SC, S>
 where
     P: NodePrimitives + Send + Sync + Unpin + 'static,
-    C: EthChainSpec + 'static,
+    C: EthChainSpec<Header = P::BlockHeader> + 'static,
     SC: StateCommitment,
     S: Default + Send + Sync + Unpin + Debug + 'static,
 {
@@ -212,7 +212,7 @@ impl<P, E, C, SC, S> NodeTypes for AnyNodeTypesWithEngine<P, E, C, SC, S>
 where
     P: NodePrimitives + Send + Sync + Unpin + 'static,
     E: EngineTypes + Send + Sync + Unpin,
-    C: EthChainSpec + 'static,
+    C: EthChainSpec<Header = P::BlockHeader> + 'static,
     SC: StateCommitment,
     S: Default + Send + Sync + Unpin + Debug + 'static,
 {
@@ -225,8 +225,8 @@ where
 impl<P, E, C, SC, S> NodeTypesWithEngine for AnyNodeTypesWithEngine<P, E, C, SC, S>
 where
     P: NodePrimitives + Send + Sync + Unpin + 'static,
-    E: EngineTypes + Send + Sync + Unpin,
-    C: EthChainSpec + 'static,
+    E: EngineTypes<BuiltPayload: BuiltPayload<Primitives = P>> + Send + Sync + Unpin,
+    C: EthChainSpec<Header = P::BlockHeader> + 'static,
     SC: StateCommitment,
     S: Default + Send + Sync + Unpin + Debug + 'static,
 {
@@ -244,3 +244,6 @@ pub type BodyTy<N> = <<N as NodeTypes>::Primitives as NodePrimitives>::BlockBody
 
 /// Helper adapter type for accessing [`NodePrimitives::SignedTx`] on [`NodeTypes`].
 pub type TxTy<N> = <<N as NodeTypes>::Primitives as NodePrimitives>::SignedTx;
+
+/// Helper adapter type for accessing [`NodePrimitives::Receipt`] on [`NodeTypes`].
+pub type ReceiptTy<N> = <<N as NodeTypes>::Primitives as NodePrimitives>::Receipt;

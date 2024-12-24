@@ -1,6 +1,7 @@
-use std::sync::Arc;
-
-use alloy_rpc_types_engine::{ExecutionPayloadEnvelopeV2, ExecutionPayloadV1};
+use alloy_rpc_types_engine::{
+    ExecutionPayload, ExecutionPayloadEnvelopeV2, ExecutionPayloadSidecar, ExecutionPayloadV1,
+    PayloadError,
+};
 use op_alloy_rpc_types_engine::{
     OpExecutionPayloadEnvelopeV3, OpExecutionPayloadEnvelopeV4, OpPayloadAttributes,
 };
@@ -11,11 +12,16 @@ use reth_node_api::{
         EngineObjectValidationError, MessageValidationKind, PayloadOrAttributes, PayloadTypes,
         VersionSpecificValidationError,
     },
-    validate_version_specific_fields, EngineTypes, EngineValidator,
+    validate_version_specific_fields, BuiltPayload, EngineTypes, EngineValidator, NodePrimitives,
+    PayloadValidator,
 };
 use reth_optimism_chainspec::OpChainSpec;
 use reth_optimism_forks::{OpHardfork, OpHardforks};
 use reth_optimism_payload_builder::{OpBuiltPayload, OpPayloadBuilderAttributes};
+use reth_payload_validator::ExecutionPayloadValidator;
+use reth_primitives::{Block, SealedBlockFor};
+use reth_rpc_types_compat::engine::payload::block_to_payload;
+use std::sync::Arc;
 
 /// The types used in the optimism beacon consensus engine.
 #[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
@@ -32,7 +38,8 @@ impl<T: PayloadTypes> PayloadTypes for OpEngineTypes<T> {
 
 impl<T: PayloadTypes> EngineTypes for OpEngineTypes<T>
 where
-    T::BuiltPayload: TryInto<ExecutionPayloadV1>
+    T::BuiltPayload: BuiltPayload<Primitives: NodePrimitives<Block = reth_primitives::Block>>
+        + TryInto<ExecutionPayloadV1>
         + TryInto<ExecutionPayloadEnvelopeV2>
         + TryInto<OpExecutionPayloadEnvelopeV3>
         + TryInto<OpExecutionPayloadEnvelopeV4>,
@@ -41,6 +48,14 @@ where
     type ExecutionPayloadEnvelopeV2 = ExecutionPayloadEnvelopeV2;
     type ExecutionPayloadEnvelopeV3 = OpExecutionPayloadEnvelopeV3;
     type ExecutionPayloadEnvelopeV4 = OpExecutionPayloadEnvelopeV4;
+
+    fn block_to_payload(
+        block: SealedBlockFor<
+            <<Self::BuiltPayload as BuiltPayload>::Primitives as NodePrimitives>::Block,
+        >,
+    ) -> (ExecutionPayload, ExecutionPayloadSidecar) {
+        block_to_payload(block)
+    }
 }
 
 /// A default payload type for [`OpEngineTypes`]
@@ -57,13 +72,90 @@ impl PayloadTypes for OpPayloadTypes {
 /// Validator for Optimism engine API.
 #[derive(Debug, Clone)]
 pub struct OpEngineValidator {
-    chain_spec: Arc<OpChainSpec>,
+    inner: ExecutionPayloadValidator<OpChainSpec>,
 }
 
 impl OpEngineValidator {
     /// Instantiates a new validator.
     pub const fn new(chain_spec: Arc<OpChainSpec>) -> Self {
-        Self { chain_spec }
+        Self { inner: ExecutionPayloadValidator::new(chain_spec) }
+    }
+
+    /// Returns the chain spec used by the validator.
+    #[inline]
+    fn chain_spec(&self) -> &OpChainSpec {
+        self.inner.chain_spec()
+    }
+}
+
+impl PayloadValidator for OpEngineValidator {
+    type Block = Block;
+
+    fn ensure_well_formed_payload(
+        &self,
+        payload: ExecutionPayload,
+        sidecar: ExecutionPayloadSidecar,
+    ) -> Result<SealedBlockFor<Self::Block>, PayloadError> {
+        self.inner.ensure_well_formed_payload(payload, sidecar)
+    }
+}
+
+impl<Types> EngineValidator<Types> for OpEngineValidator
+where
+    Types: EngineTypes<PayloadAttributes = OpPayloadAttributes>,
+{
+    fn validate_version_specific_fields(
+        &self,
+        version: EngineApiMessageVersion,
+        payload_or_attrs: PayloadOrAttributes<'_, OpPayloadAttributes>,
+    ) -> Result<(), EngineObjectValidationError> {
+        validate_withdrawals_presence(
+            self.chain_spec(),
+            version,
+            payload_or_attrs.message_validation_kind(),
+            payload_or_attrs.timestamp(),
+            payload_or_attrs.withdrawals().is_some(),
+        )?;
+        validate_parent_beacon_block_root_presence(
+            self.chain_spec(),
+            version,
+            payload_or_attrs.message_validation_kind(),
+            payload_or_attrs.timestamp(),
+            payload_or_attrs.parent_beacon_block_root().is_some(),
+        )
+    }
+
+    fn ensure_well_formed_attributes(
+        &self,
+        version: EngineApiMessageVersion,
+        attributes: &OpPayloadAttributes,
+    ) -> Result<(), EngineObjectValidationError> {
+        validate_version_specific_fields(self.chain_spec(), version, attributes.into())?;
+
+        if attributes.gas_limit.is_none() {
+            return Err(EngineObjectValidationError::InvalidParams(
+                "MissingGasLimitInPayloadAttributes".to_string().into(),
+            ))
+        }
+
+        if self
+            .chain_spec()
+            .is_holocene_active_at_timestamp(attributes.payload_attributes.timestamp)
+        {
+            let (elasticity, denominator) =
+                attributes.decode_eip_1559_params().ok_or_else(|| {
+                    EngineObjectValidationError::InvalidParams(
+                        "MissingEip1559ParamsInPayloadAttributes".to_string().into(),
+                    )
+                })?;
+            if elasticity != 0 && denominator == 0 {
+                return Err(EngineObjectValidationError::InvalidParams(
+                    "Eip1559ParamsDenominatorZero".to_string().into(),
+                ))
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -109,63 +201,6 @@ pub fn validate_withdrawals_presence(
     Ok(())
 }
 
-impl<Types> EngineValidator<Types> for OpEngineValidator
-where
-    Types: EngineTypes<PayloadAttributes = OpPayloadAttributes>,
-{
-    fn validate_version_specific_fields(
-        &self,
-        version: EngineApiMessageVersion,
-        payload_or_attrs: PayloadOrAttributes<'_, OpPayloadAttributes>,
-    ) -> Result<(), EngineObjectValidationError> {
-        validate_withdrawals_presence(
-            &self.chain_spec,
-            version,
-            payload_or_attrs.message_validation_kind(),
-            payload_or_attrs.timestamp(),
-            payload_or_attrs.withdrawals().is_some(),
-        )?;
-        validate_parent_beacon_block_root_presence(
-            &self.chain_spec,
-            version,
-            payload_or_attrs.message_validation_kind(),
-            payload_or_attrs.timestamp(),
-            payload_or_attrs.parent_beacon_block_root().is_some(),
-        )
-    }
-
-    fn ensure_well_formed_attributes(
-        &self,
-        version: EngineApiMessageVersion,
-        attributes: &OpPayloadAttributes,
-    ) -> Result<(), EngineObjectValidationError> {
-        validate_version_specific_fields(&self.chain_spec, version, attributes.into())?;
-
-        if attributes.gas_limit.is_none() {
-            return Err(EngineObjectValidationError::InvalidParams(
-                "MissingGasLimitInPayloadAttributes".to_string().into(),
-            ))
-        }
-
-        if self.chain_spec.is_holocene_active_at_timestamp(attributes.payload_attributes.timestamp)
-        {
-            let (elasticity, denominator) =
-                attributes.decode_eip_1559_params().ok_or_else(|| {
-                    EngineObjectValidationError::InvalidParams(
-                        "MissingEip1559ParamsInPayloadAttributes".to_string().into(),
-                    )
-                })?;
-            if elasticity != 0 && denominator == 0 {
-                return Err(EngineObjectValidationError::InvalidParams(
-                    "Eip1559ParamsDenominatorZero".to_string().into(),
-                ))
-            }
-        }
-
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod test {
 
@@ -188,7 +223,6 @@ mod test {
                     .paris_block_and_final_difficulty,
                 hardforks,
                 base_fee_params: BASE_SEPOLIA.inner.base_fee_params.clone(),
-                max_gas_limit: BASE_SEPOLIA.inner.max_gas_limit,
                 prune_delete_limit: 10000,
                 ..Default::default()
             },
@@ -207,6 +241,8 @@ mod test {
                 suggested_fee_recipient: Address::ZERO,
                 withdrawals: Some(vec![]),
                 parent_beacon_block_root: Some(B256::ZERO),
+                target_blobs_per_block: None,
+                max_blobs_per_block: None,
             },
         }
     }

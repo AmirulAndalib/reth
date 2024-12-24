@@ -2,7 +2,10 @@
 //! file.
 use clap::Parser;
 use reth_cli::chainspec::ChainSpecParser;
-use reth_cli_commands::common::{AccessRights, CliNodeTypes, Environment, EnvironmentArgs};
+use reth_cli_commands::{
+    common::{AccessRights, CliNodeTypes, Environment, EnvironmentArgs},
+    import::build_import_pipeline,
+};
 use reth_consensus::noop::NoopConsensus;
 use reth_db::tables;
 use reth_db_api::transaction::DbTx;
@@ -11,15 +14,14 @@ use reth_downloaders::file_client::{
 };
 use reth_node_core::version::SHORT_VERSION;
 use reth_optimism_chainspec::OpChainSpec;
-use reth_optimism_primitives::bedrock::is_dup_tx;
-use reth_provider::StageCheckpointReader;
+use reth_optimism_evm::OpExecutorProvider;
+use reth_optimism_primitives::{bedrock::is_dup_tx, OpPrimitives};
+use reth_provider::{ChainSpecProvider, StageCheckpointReader};
 use reth_prune::PruneModes;
 use reth_stages::StageId;
 use reth_static_file::StaticFileProducer;
 use std::{path::PathBuf, sync::Arc};
 use tracing::{debug, error, info};
-
-use crate::commands::build_pipeline::build_import_pipeline;
 
 /// Syncs RLP encoded blocks from a file.
 #[derive(Debug, Parser)]
@@ -41,7 +43,9 @@ pub struct ImportOpCommand<C: ChainSpecParser> {
 
 impl<C: ChainSpecParser<ChainSpec = OpChainSpec>> ImportOpCommand<C> {
     /// Execute `import` command
-    pub async fn execute<N: CliNodeTypes<ChainSpec = C::ChainSpec>>(self) -> eyre::Result<()> {
+    pub async fn execute<N: CliNodeTypes<ChainSpec = C::ChainSpec, Primitives = OpPrimitives>>(
+        self,
+    ) -> eyre::Result<()> {
         info!(target: "reth::cli", "reth {} starting", SHORT_VERSION);
 
         info!(target: "reth::cli",
@@ -94,8 +98,8 @@ impl<C: ChainSpecParser<ChainSpec = OpChainSpec>> ImportOpCommand<C> {
                 Arc::new(file_client),
                 StaticFileProducer::new(provider_factory.clone(), PruneModes::default()),
                 true,
-            )
-            .await?;
+                OpExecutorProvider::optimism(provider_factory.chain_spec()),
+            )?;
 
             // override the tip
             pipeline.set_tip(tip);

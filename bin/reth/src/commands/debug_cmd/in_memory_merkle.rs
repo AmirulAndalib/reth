@@ -19,12 +19,13 @@ use reth_evm::execute::{BlockExecutorProvider, Executor};
 use reth_execution_types::ExecutionOutcome;
 use reth_network::{BlockDownloaderProvider, NetworkHandle};
 use reth_network_api::NetworkInfo;
+use reth_node_api::{BlockTy, NodePrimitives};
 use reth_node_ethereum::EthExecutorProvider;
-use reth_primitives::BlockExt;
+use reth_primitives::{BlockExt, EthPrimitives};
 use reth_provider::{
-    providers::ProviderNodeTypes, writer::UnifiedStorageWriter, AccountExtReader,
-    ChainSpecProvider, HashingWriter, HeaderProvider, LatestStateProviderRef, OriginalValuesKnown,
-    ProviderFactory, StageCheckpointReader, StateWriter, StorageReader,
+    providers::ProviderNodeTypes, AccountExtReader, ChainSpecProvider, DatabaseProviderFactory,
+    HashedPostStateProvider, HashingWriter, LatestStateProviderRef, OriginalValuesKnown,
+    ProviderFactory, StageCheckpointReader, StateWriter, StorageLocation, StorageReader,
 };
 use reth_revm::database::StateProviderDatabase;
 use reth_stages::StageId;
@@ -56,7 +57,16 @@ pub struct Command<C: ChainSpecParser> {
 }
 
 impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
-    async fn build_network<N: ProviderNodeTypes<ChainSpec = C::ChainSpec>>(
+    async fn build_network<
+        N: ProviderNodeTypes<
+            ChainSpec = C::ChainSpec,
+            Primitives: NodePrimitives<
+                Block = reth_primitives::Block,
+                Receipt = reth_primitives::Receipt,
+                BlockHeader = reth_primitives::Header,
+            >,
+        >,
+    >(
         &self,
         config: &Config,
         task_executor: TaskExecutor,
@@ -78,7 +88,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
     }
 
     /// Execute `debug in-memory-merkle` command
-    pub async fn execute<N: CliNodeTypes<ChainSpec = C::ChainSpec>>(
+    pub async fn execute<N: CliNodeTypes<ChainSpec = C::ChainSpec, Primitives = EthPrimitives>>(
         self,
         ctx: CliContext,
     ) -> eyre::Result<()> {
@@ -133,29 +143,23 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
             )
             .await?;
 
-        let db = StateProviderDatabase::new(LatestStateProviderRef::new(&provider));
+        let state_provider = LatestStateProviderRef::new(&provider);
+        let db = StateProviderDatabase::new(&state_provider);
 
         let executor = EthExecutorProvider::ethereum(provider_factory.chain_spec()).executor(db);
-
-        let merkle_block_td =
-            provider.header_td_by_number(merkle_block_number)?.unwrap_or_default();
         let block_execution_output = executor.execute(
-            (
-                &block
-                    .clone()
-                    .unseal()
-                    .with_recovered_senders()
-                    .ok_or(BlockValidationError::SenderRecoveryError)?,
-                merkle_block_td + block.difficulty,
-            )
-                .into(),
+            &block
+                .clone()
+                .unseal::<BlockTy<N>>()
+                .with_recovered_senders()
+                .ok_or(BlockValidationError::SenderRecoveryError)?,
         )?;
         let execution_outcome = ExecutionOutcome::from((block_execution_output, block.number));
 
         // Unpacked `BundleState::state_root_slow` function
         let (in_memory_state_root, in_memory_updates) = StateRoot::overlay_root_with_updates(
             provider.tx_ref(),
-            execution_outcome.hash_state_slow(),
+            state_provider.hashed_post_state(execution_outcome.state()),
         )?;
 
         if in_memory_state_root == block.state_root {
@@ -163,7 +167,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
             return Ok(())
         }
 
-        let provider_rw = provider_factory.provider_rw()?;
+        let provider_rw = provider_factory.database_provider_rw()?;
 
         // Insert block, state and hashes
         provider_rw.insert_historical_block(
@@ -172,8 +176,11 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
                 .try_seal_with_senders()
                 .map_err(|_| BlockValidationError::SenderRecoveryError)?,
         )?;
-        let mut storage_writer = UnifiedStorageWriter::from_database(&provider_rw.0);
-        storage_writer.write_to_storage(execution_outcome, OriginalValuesKnown::No)?;
+        provider_rw.write_state(
+            execution_outcome,
+            OriginalValuesKnown::No,
+            StorageLocation::Database,
+        )?;
         let storage_lists = provider_rw.changed_storages_with_range(block.number..=block.number)?;
         let storages = provider_rw.plain_state_storages(storage_lists)?;
         provider_rw.insert_storage_for_hashing(storages)?;

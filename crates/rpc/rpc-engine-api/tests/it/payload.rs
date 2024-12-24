@@ -28,6 +28,7 @@ fn transform_block<F: FnOnce(Block) -> Block>(src: SealedBlock, f: F) -> Executi
         header: SealedHeader::seal(transformed.header),
         body: transformed.body,
     })
+    .0
 }
 
 #[test]
@@ -38,7 +39,7 @@ fn payload_body_roundtrip() {
         0..=99,
         BlockRangeParams { tx_count: 0..2, ..Default::default() },
     ) {
-        let unsealed = block.clone().unseal();
+        let unsealed = block.clone().unseal::<Block>();
         let payload_body: ExecutionPayloadBodyV1 = convert_to_payload_body_v1(unsealed);
 
         assert_eq!(
@@ -107,7 +108,8 @@ fn payload_validation() {
     payload_with_invalid_txs.transactions.iter_mut().for_each(|tx| {
         *tx = Bytes::new();
     });
-    let payload_with_invalid_txs = try_payload_v1_to_block(payload_with_invalid_txs);
+    let payload_with_invalid_txs =
+        try_payload_v1_to_block::<TransactionSigned>(payload_with_invalid_txs);
     assert_matches!(payload_with_invalid_txs, Err(PayloadError::Decode(RlpError::InputTooShort)));
 
     // Non empty ommers
