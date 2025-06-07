@@ -1191,12 +1191,7 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> BlockReader for DatabaseProvid
 
         Ok(None)
     }
-
-    fn pending_block(&self) -> ProviderResult<Option<SealedBlock<Self::Block>>> {
-        Ok(None)
-    }
-
-    fn pending_block_with_senders(&self) -> ProviderResult<Option<RecoveredBlock<Self::Block>>> {
+    fn pending_block(&self) -> ProviderResult<Option<RecoveredBlock<Self::Block>>> {
         Ok(None)
     }
 
@@ -2956,13 +2951,6 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
                 // Increment transaction id for each transaction.
                 next_tx_num += 1;
             }
-
-            debug!(
-                target: "providers::db",
-                ?block_number,
-                actions = ?durations_recorder.actions,
-                "Inserted block body"
-            );
         }
 
         self.storage.writer().write_block_bodies(self, bodies, write_to)?;
